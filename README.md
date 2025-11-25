@@ -1,177 +1,219 @@
-📄 Taiwan E-Invoice OCR System
-UNet + OCR + LLM for Automatic Invoice Field Extraction
+# 🧾 Taiwan E-Invoice OCR System  
+### **UNet + OCR + LLM for Automatic Invoice Field Extraction**
 
-本專案是一個完整的台灣電子發票自動化資訊擷取系統，結合 深度學習語意分割（UNet）、Tesseract OCR 與 Large Language Model（LLM），能從發票影像中準確擷取：
+本專案實作一套 **台灣電子發票欄位自動擷取系統**，從原始影像到結構化 JSON 完全自動化。  
+系統結合 **UNet 影像分割、Tesseract OCR、與 LLM 後處理**，可精準擷取：
 
-🧾 發票號碼（invoice_no）
+- **發票號碼（invoice_no）**  
+- **發票日期（date）**  
+- **總金額（total_amount）**
 
-📅 發票日期（date）
+我們團隊使用 Labelme 手動標註 **160 張台灣電子發票**，完成系統訓練與部署。
 
-💰 總金額（total_amount）
+---
 
-本系統由團隊自行標註 160 張臺灣電子發票，並完成從訓練到系統部署的完整工作流程。
+## 📌 **Project Overview**
 
-🚀 Features
-✔ 1. UNet Segmentation
+```
+Taiwan E-Invoice OCR System
+│
+├── 1️⃣ UNet Segmentation
+│      ├── invoice_no 區域
+│      ├── date 區域
+│      └── total_amount 區域
+│
+├── 2️⃣ OCR (Tesseract)
+│      └── 對各區域進行文字辨識
+│
+└── 3️⃣ LLM Post-processing
+       ├── 修正 OCR 錯字
+       ├── 格式化日期
+       ├── 金額合理性檢查
+       └── 輸出結構化 JSON
+```
 
-使用 Labelme 標註 3 類欄位區塊
+（使用「純文字架構圖」確保在 GitHub 不會跑版）
 
-UNet 模型負責定位「發票號碼／日期／金額」的影像位置
+---
 
-訓練過程中會自動輸出可視化結果（真值 Mask vs 預測 Mask）
+## 🚀 **Features**
 
-✔ 2. OCR 文字辨識
+### ✔ UNet Segmentation  
+- 自行標註 160 張 Labelme polygon  
+- 模型輸出三種欄位的 segmentation mask  
+- 訓練期間自動可視化結果（true mask / pred mask）
 
-使用 Tesseract OCR 逐區塊辨識
+### ✔ OCR Recognition  
+- 使用 **Tesseract OCR**  
+- 針對每個 Segmentation 區域裁切後辨識  
+- 大幅提升 OCR 精準度
 
-減少背景干擾、提高辨識準確度
+### ✔ LLM Post-processing  
+LLM 用於：
 
-✔ 3. LLM 後處理
+- 修正 OCR 誤判（1/7、0/O 等）  
+- 日期補格式（例：`112/01/03` → `2023-01-03`）  
+- 金額數字清洗  
+- 輸出標準化 JSON
 
-LLM 負責：
+### ✔ Streamlit Web Demo  
+使用者可以：
 
-修正 OCR 誤判（0/O、1/l 等）
+- 上傳發票  
+- 檢視 segmentation mask  
+- 檢視欄位裁切 crop  
+- 查看 OCR + LLM 的最終解析結果  
 
-日期格式轉換（例：112/01/03 → 2023-01-03）
+---
 
-金額格式化與合理性檢查
+## 📁 **Project Structure**
 
-最終輸出標準化 JSON
+```
+invoice_project/
+│
+├── data/
+│   ├── images/          # 原始發票圖片
+│   ├── masks/           # 由 labelme JSON 轉換的 segmentation mask
+│
+├── dataset.py           # PyTorch Dataset + augmentation
+├── json_to_mask.py      # JSON → mask 轉換工具
+├── train.py             # UNet 訓練（含可視化）
+├── unet_model.py        # UNet 模型結構
+├── inference.py         # Segmentation + OCR + LLM 推論
+├── app.py               # Streamlit Web App
+└── checkpoints/         # 模型權重
+```
 
-✔ 4. Web Demo
+---
 
-使用 Streamlit 打造互動式介面：
+## 🛠️ **Installation**
 
-上傳發票圖片
+### 1. Clone the repo
+```bash
+git clone https://github.com/<yourname>/invoice-ocr-system
+cd invoice-ocr-system
+```
 
-顯示 segmentation mask
+### 2. Install dependencies
+（如需，我可以幫你產生 requirements.txt）
 
-顯示裁切後的欄位區塊
-
-顯示 OCR + LLM 最終輸出
-🏷️ Data Annotation (Labelme)
-
-團隊使用 Labelme 標記以下欄位：
-
-Class ID	Label
-0	background
-1	invoice_no
-2	date
-3	total_amount
-
-轉換 JSON → mask：
-
-python json_to_mask.py
-
-🧠 Model Training (UNet)
-
-訓練指令：
-
-python train.py
-
-
-訓練特點：
-
-data augmentation
-
-每個 epoch 產生可視化輸出：
-
-epochX_img.png
-
-epochX_true_mask.png
-
-epochX_pred_mask.png
-
-自動儲存：
-
-unet_epochX.pth
-
-best_unet_model.pth
-
-🔍 Inference Flow (Segmentation → OCR → LLM)
-
-推論流程整合於 inference.py：
-
-UNet 產生 segmentation mask
-
-自動裁切三大欄位區域
-
-使用 Tesseract OCR 辨識裁切內容
-
-使用 LLM 校正格式並生成結構化 JSON
-
-🖥️ Streamlit Web Demo
-
-啟動：
-
-streamlit run app.py
-
-
-Demo 功能：
-
-上傳發票圖片
-
-顯示 UNet segmentation 結果
-
-顯示三大欄位裁切區域
-
-顯示 OCR + LLM 的解析結果
-
-輸出 JSON
-
-📈 Training Visualization
-
-訓練過程可於 visualize/ 查看 segmentation：
-
-發票欄位定位是否成功
-
-mask 是否收斂
-
-模型是否正確學會三類欄位區域
-
-🛠️ Technologies Used
-技術	說明
-UNet	三類欄位的 segmentation
-Labelme	手動標註與 polygon 標記
-PyTorch	模型訓練
-Tesseract OCR	區塊文字辨識
-OpenAI LLM	文字校正與 JSON 輸出
-Streamlit	Web Demo
-📦 Installation
-1. 安裝必要套件
+```bash
 pip install -r requirements.txt
+```
 
+### 3. Install Tesseract OCR（Windows）
+請安裝後確認路徑如下：
 
-若無 requirements.txt，我能替你生成。
-
-2. 安裝 Tesseract OCR（Windows）
-
-請安裝官方版本並加入 PATH：
-
+```
 C:\Program Files\Tesseract-OCR\tesseract.exe
+```
 
-📜 Example Output (JSON)
+---
+
+## 🎯 **Training UNet**
+
+```bash
+python train.py
+```
+
+訓練時會自動輸出：
+
+```
+visualize/
+  ├── epoch1_img.png
+  ├── epoch1_true_mask.png
+  └── epoch1_pred_mask.png
+```
+
+以及：
+
+```
+checkpoints/
+  ├── unet_epoch1.pth
+  ├── unet_epoch2.pth
+  └── best_unet_model.pth
+```
+
+---
+
+## 🔍 **Run Inference**
+
+```bash
+python inference.py
+```
+
+輸出會包含：
+
+- segmentation mask  
+- bbox  
+- crop images  
+- OCR raw text  
+- LLM 修正後 JSON  
+
+---
+
+## 🖥️ **Streamlit Web Demo**
+
+```bash
+streamlit run app.py
+```
+
+Demo 包含：
+
+- 上傳圖片  
+- 自動 segmentation  
+- OCR + LLM 結果  
+- 結構化資料顯示  
+
+---
+
+## 📦 **Example Output**
+
+```json
 {
   "invoice_no": "AB12345678",
   "date": "2023-01-05",
   "total_amount": 268
 }
+```
 
-🤝 Contribution
+---
 
-歡迎 issue / PR！
+## 🧩 **Tech Stack**
+
+| Component | Technology |
+|----------|------------|
+| Segmentation | UNet (PyTorch) |
+| Annotation | Labelme |
+| OCR | Tesseract |
+| LLM | OpenAI / gpt-4.1-mini / GPT-5 |
+| Web UI | Streamlit |
+| Data Augmentation | Albumentations |
+
+---
+
+## 🤝 **Contributions**
+
+歡迎提出 issue / PR！  
 如果你想新增：
 
-YOLO-based 文字偵測
+- YOLOv8 / YOLO-World for text detection  
+- OCR-free end-to-end 模型  
+- FastAPI REST API  
+- Cloud 部署（Railway / Render）  
 
-LLM-based OCR end-to-end
+都非常歡迎。
 
-多欄位擴增（店名、品項）
+---
 
-FastAPI 版本
+## 📄 License
 
-都可以提出。
+MIT License.
 
-📄 License
+---
 
-MIT License
+## ⭐ Support
+
+如果這個專案對你有幫助，  
+請幫忙點個 ⭐️ 支持！
+
