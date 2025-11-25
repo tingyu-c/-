@@ -1,0 +1,26 @@
+# Core DL
+torch
+torchvision
+
+# Image processing
+opencv-python
+Pillow
+numpy
+
+# OCR
+pytesseract
+
+# ML Utils
+albumentations
+
+# Web UI
+streamlit
+
+# LLM
+openai
+
+# Data
+pandas
+
+# Training / Debug
+tqdm
