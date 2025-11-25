@@ -176,7 +176,50 @@ Demo 包含：
   "total_amount": 268
 }
 ```
+## 📂 Dataset Availability
 
+本專案使用 **160 張台灣電子發票** 作為訓練資料，並由團隊自行使用  
+**Labelme** 進行欄位標註（invoice_no / date / total_amount）。
+
+由於資料中包含：
+
+- 真實店家名稱  
+- 發票號碼  
+- 購買日期與金額  
+- 可能涉及隱私或商業資訊  
+
+因此 **無法於 GitHub 公開整套完整資料集**。
+
+這也是許多包含實體文件、醫療資料、收據、票據的專案常見的限制。
+
+### 🔒 Why the dataset cannot be published?
+
+- 涉及真實消費資訊  
+- 屬於企業或個人票據資料  
+- 台灣發票屬於具隱私性文件，不適合公開大量原始影像  
+- 可能造成資料外洩與法規風險  
+
+基於以上原因，我們選擇不將完整 dataset 放上 GitHub。
+
+
+## 🔧 How to Train the Model?
+
+若您需要訓練自己的模型：
+
+1. 準備自己的台灣電子發票資料  
+2. 使用 Labelme 標註三個欄位：
+   - `invoice_no`
+   - `date`
+   - `total_amount`
+3. 使用本專案提供的工具：
+   - `json_to_mask.py`：將 Labelme JSON 轉換為 segmentation masks  
+   - `train.py`：進行 UNet 模型訓練  
+---
+
+## 📬 Need the dataset?
+
+如需完整資料集進行研究用途，可透過 Issue 或 Email 與作者聯繫。  
+我們可提供資料格式範本、標註流程指南，但 **無法提供完整未遮蔽資料影像**。
 ---
 
 ## 🧩 **Tech Stack**
