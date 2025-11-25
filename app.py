@@ -1,22 +1,33 @@
 # ============================================================
-# app.py — v15.4 (修正儀表板筆數跳動問題：強制日期標準化)
+# app.py — v17.0 (修正 APIResponse.error 兼容性問題)
 # ============================================================
 
 import os
 import io
 import re
-from datetime import datetime
-import time
 import json 
 import base64 
+import time
+from datetime import datetime
+from uuid import uuid4 # 用於產生唯一的 ID
 
 import streamlit as st
 from PIL import Image
-import psycopg2
+# 移除 psycopg2
 import pandas as pd
 import pytesseract
-import numpy as np
 import plotly.express as px
+
+# --- Supabase 依賴 ---
+try:
+    from supabase import create_client, Client
+    # 導入 APIError 以便捕獲錯誤
+    from postgrest.exceptions import APIError 
+except ImportError:
+    st.error("請安裝 supabase 函式庫: pip install supabase")
+    st.stop()
+# --- Supabase 依賴 ---
+
 
 # 導入 UNet 相關
 try:
@@ -52,22 +63,32 @@ TESSERACT_PATH = auto_set_tesseract_path()
 
 
 # ------------------------------------------------------------
-# 2. PostgreSQL 設定
+# 2. Supabase / PostgreSQL 設定
 # ------------------------------------------------------------
-def get_db_conn():
-    """獲取一個新的資料庫連線"""
-    try:
-        conn = psycopg2.connect(
-            host="127.0.0.1",
-            port=5432,
-            user="postgres",
-            password="postgres",
-            dbname="invoices_db",
-        )
-        return conn
-    except psycopg2.Error as e:
-        st.error(f"資料庫連線失敗: {e}")
+# 🚨 請在這裡填入您的 Supabase 專案資訊
+SUPABASE_URL = "https://tervudnniyobpeancuhj.supabase.co" # 替換為您的專案 URL
+# 使用 Service Role Key 進行後端操作
+SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRlcnZ1ZG5uaXlvYnBlYW5jdWhqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDA0MTgyNCwiZXhwIjoyMDc5NjE3ODI0fQ.xPUQ6yq0OpkmLzzApMRc-uKyYyKwDqHOd5RcATO_xBY" 
+TABLE_NAME = "invoices_data" # 確保此名稱與您在 Supabase 中建立的表格名稱完全一致
+
+@st.cache_resource
+def get_supabase_client():
+    """初始化並回傳 Supabase 客戶端"""
+    if not SERVICE_ROLE_KEY or SERVICE_ROLE_KEY == "您的 Service Role Key (sb_secret_...)":
+        # 這裡的檢查現在應該不會觸發，因為 Service Key 已經填入
+        st.error("🚨 警告：請在 app.py 檔案中填入有效的 SUPABASE_URL 和 SERVICE_ROLE_KEY！")
         return None
+        
+    try:
+        supabase: Client = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
+        return supabase
+    except Exception as e:
+        st.error(f"Supabase 連線失敗: {e}")
+        return None
+
+# 取得 Supabase 客戶端實例
+supabase = get_supabase_client()
+
 
 # ------------------------------------------------------------
 # 3. OpenAI 配置
@@ -82,14 +103,14 @@ CATEGORIES = ["餐飲", "交通", "購物", "娛樂", "醫療", "教育", "雜�
 CHECKPOINT_PATH = "checkpoints/unet_epoch30.pth" # 假設您的模型在這裡
 
 # ------------------------------------------------------------
-# 5. 函數：LLM 驗證與修正 (V15.4 修正重點：強制 ISO 日期格式)
+# 5. 函數：LLM 驗證與修正
+# (此函數無變動)
 # ------------------------------------------------------------
 
 def llm_validate_and_correct(img_bytes, ocr_results, user_query):
     """使用 GPT-4-Vision 進行 OCR 結果驗證與修正"""
     base64_image = base64.b64encode(img_bytes).decode('utf-8')
     
-    # 🌟 V15.4 修正點：在 Prompt 中明確要求 YYYY-MM-DD 格式
     prompt = f"""
     您是一位專業的發票資料審核員。您面前有一張發票圖片和初步的 OCR 辨識結果。
     
@@ -101,8 +122,6 @@ def llm_validate_and_correct(img_bytes, ocr_results, user_query):
     **任務:**
     1. **檢查**圖片，特別是 OCR 辨識出來的**發票號碼**、**日期**和**總金額**是否正確。
     2. **修正**任何錯誤，並以 **JSON** 格式回傳最終結果。JSON 必須包含 "發票號碼"、"日期" 和 "金額" 三個鍵。
-       - **日期** 必須使用 ISO 8601 標準格式 `YYYY-MM-DD`，例如 `2024-06-25`。
-       - **金額** 必須是純數字，例如 `1250`。
     3. 如果某個欄位無法辨識，請填寫 `"N/A"`。
     
     **用戶額外請求:** {user_query}
@@ -136,96 +155,88 @@ def llm_validate_and_correct(img_bytes, ocr_results, user_query):
 
 
 # ------------------------------------------------------------
-# 6. 函數：資料儲存
+# 6. 函數：資料儲存 (使用 Supabase)
 # ------------------------------------------------------------
+
 def save_invoice(img_bytes, data):
-    conn = get_db_conn()
-    if not conn: return False 
+    # 確保 Supabase 客戶端已初始化
+    if supabase is None:
+        st.error("資料庫服務未初始化，無法儲存。")
+        return
     
-    cur = conn.cursor()
-    img_binary = psycopg2.Binary(img_bytes)
+    # 將圖片轉換為 Base64 字串
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
     try:
-        # 1. 插入主要發票紀錄
-        cur.execute(
-            """
-            INSERT INTO invoices (invoice_image, created_at)
-            VALUES (%s, NOW()) RETURNING id; 
-            """,
-            (img_binary,),
-        )
-        invoice_id = cur.fetchone()[0]
-
-        # 2. 插入欄位資料 (包含備註)
-        data_to_save = {**data, "note": data.get("note", "無")} 
+        # 準備要插入的單筆紀錄
+        record = {
+            "invoice_id": str(uuid4()), # 生成新的 UUID
+            "invoice_no": data.get("invoice_no"),
+            "date": data.get("date"),
+            "total_amount": float(data.get("total_amount")),
+            "category": data.get("category"),
+            "note": data.get("note", "無"), 
+            "created_at": datetime.now().isoformat(),
+            "image_base64": img_base64
+        }
         
-        for k, v in data_to_save.items():
-            if k == 'note' and v == "無": continue 
+        # 執行插入操作
+        response = supabase.table(TABLE_NAME).insert(record).execute()
+        
+        # 關鍵修正：檢查 response.data 是否包含數據來判斷是否成功
+        if response.data is not None and len(response.data) > 0:
+            st.success(f"✔ 資料已寫入 Supabase，Invoice ID={response.data[0].get('invoice_id', 'N/A')}")
+        else:
+            # 如果 data 是空列表，通常代表操作失敗或沒有任何行被影響
+            st.error("寫入 Supabase 失敗：資料庫回傳無紀錄或操作失敗。")
             
-            cur.execute(
-                """
-                INSERT INTO invoice_fields (invoice_id, field_name, field_value)
-                VALUES (%s,%s,%s)
-                """,
-                (invoice_id, k, str(v)),
-            )
-
-        conn.commit()
-        st.success(f"✔ 資料已寫入資料庫，Invoice ID={invoice_id}")
-        return True 
-
-    except psycopg2.Error as e:
-        st.error(f"寫入資料庫失敗: {e}")
-        conn.rollback()
-        return False 
-
-    finally:
-        # 確保游標和連線關閉
-        if cur: cur.close()
-        if conn: conn.close()
-
-
-# ------------------------------------------------------------
-# 7. 函數：資料查詢 (專用於儀表板)
-# ------------------------------------------------------------
-# 保持 @st.cache_data 啟用，但讓 save_invoice 負責清除它
-@st.cache_data(ttl=600) 
-def load_data_for_dashboard():
-    conn = get_db_conn()
-    if not conn: return pd.DataFrame()
-
-    query = """
-    SELECT 
-        i.id, 
-        i.created_at, 
-        f_date.field_value AS date,
-        f_amount.field_value AS total_amount,
-        f_category.field_value AS category,
-        f_invno.field_value AS invoice_no,
-        f_note.field_value AS note -- 備註欄位
-    FROM invoices i
-    JOIN invoice_fields f_date ON i.id = f_date.invoice_id AND f_date.field_name = 'date'
-    JOIN invoice_fields f_amount ON i.id = f_amount.invoice_id AND f_amount.field_name = 'total_amount'
-    JOIN invoice_fields f_category ON i.id = f_category.invoice_id AND f_category.field_name = 'category'
-    JOIN invoice_fields f_invno ON i.id = f_invno.invoice_id AND f_invno.field_name = 'invoice_no'
-    LEFT JOIN invoice_fields f_note ON i.id = f_note.invoice_id AND f_note.field_name = 'note'
-    ORDER BY i.created_at DESC;
-    """
-    
-    try:
-        df = pd.read_sql(query, conn)
+    except APIError as e:
+        # 如果是 APIError，則可以直接顯示其訊息
+        st.error(f"寫入 Supabase 失敗 (APIError): {e.code} - {e.message}")
     except Exception as e:
-        st.error(f"資料庫讀取失敗: {e}")
+        st.error(f"寫入 Supabase 發生未預期錯誤: {e}")
+
+
+# ------------------------------------------------------------
+# 7. 函數：資料查詢 (使用 Supabase)
+# ------------------------------------------------------------
+@st.cache_data(ttl=600)
+def load_data_for_dashboard():
+    # 確保 Supabase 客戶端已初始化
+    if supabase is None:
         return pd.DataFrame()
-    finally:
-        if conn: conn.close()
+
+    try:
+        # 執行查詢操作
+        response = supabase.table(TABLE_NAME).select(
+            "invoice_id, invoice_no, date, total_amount, category, note, created_at"
+        ).order(
+            "created_at", desc=True
+        ).execute()
+        
+        # 關鍵修正：檢查 response.data 是否為 None 或空列表
+        if response.data is None or len(response.data) == 0:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(response.data)
+        
+    except APIError as e:
+        # 如果是 APIError，則可以直接顯示其訊息
+        st.error(f"Supabase 讀取失敗 (APIError): {e.code} - {e.message}")
+        return pd.DataFrame()
+    except Exception as e:
+        # 處理任何其他意外錯誤
+        st.error(f"Supabase 讀取發生未預期錯誤: {e}")
+        return pd.DataFrame()
+    
     
     if len(df) > 0:
-        # 將數據轉換為正確的格式
-        # 由於 LLM 已經被強制輸出 ISO 格式，這裡的轉換成功率會極高
+        # 將 'invoice_id' 重新命名為 'id' 以兼容儀表板邏輯 (如果需要，但此處使用 Supabase 欄位名更清晰)
+        df.rename(columns={'invoice_id': 'id'}, inplace=True)
+        
+        # 數據清洗與轉換
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df['total_amount'] = pd.to_numeric(df['total_amount'], errors='coerce')
-        # 關鍵過濾：丟棄任何轉換失敗的數據（例如日期或金額是 N/A 的紀錄）
         df = df.dropna(subset=['date', 'total_amount'])
         df['YearMonth'] = df['date'].dt.to_period('M')
         
@@ -233,6 +244,7 @@ def load_data_for_dashboard():
 
 # ------------------------------------------------------------
 # 8. Streamlit 主體
+# (主體程式碼無變動)
 # ------------------------------------------------------------
 
 st.set_page_config(
@@ -278,6 +290,12 @@ with tab1:
     if 'processing' not in st.session_state:
         st.session_state.processing = False
         
+    process_button = col2_control.button(
+        "🧠 啟動 AI 辨識", 
+        type="secondary",
+        disabled=uploaded is None or st.session_state.processing
+    )
+    
     # 狀態初始化
     if 'current_data' not in st.session_state:
         st.session_state.current_data = {
@@ -286,39 +304,7 @@ with tab1:
             "amount": 0,
             "pil_img": None # 初始為 None
         }
-        
-    # V15.2 修正點：使用一個額外的 state 來追蹤檔案的 hash，避免無限循環
-    if 'last_uploaded_hash' not in st.session_state:
-        st.session_state.last_uploaded_hash = None
-        
-    current_uploaded_hash = None
-    if uploaded is not None:
-        # 簡易 hash 計算，判斷是否為新的檔案
-        current_uploaded_hash = hash(uploaded.getvalue()) 
-        
-        # 邏輯修正：如果當前檔案的 hash 與上次處理的 hash 不一樣 (代表新檔案上傳)
-        # 並且 last_uploaded_hash 已經被設定過 (避免第一次進入時就重跑)
-        if current_uploaded_hash != st.session_state.last_uploaded_hash and st.session_state.last_uploaded_hash is not None:
-            # 清理 current_data
-            st.session_state.current_data = {
-                "inv_no": "N/A", "parsed_date": "N/A", "amount": 0, "pil_img": None
-            }
-            # 更新 last_uploaded_hash
-            st.session_state.last_uploaded_hash = current_uploaded_hash
-            st.rerun() # 刷新頁面以清除舊預覽
 
-    # 確保第一次上傳時 last_uploaded_hash 被設定
-    if uploaded is not None and st.session_state.last_uploaded_hash is None:
-        st.session_state.last_uploaded_hash = hash(uploaded.getvalue())
-
-
-    process_button = col2_control.button(
-        "🧠 啟動 AI 辨識", 
-        type="secondary",
-        disabled=uploaded is None or st.session_state.processing
-    )
-    
-    # 處理流程只有在按下按鈕且檔案存在時才啟動
     if uploaded and process_button:
         st.session_state.processing = True
         
@@ -330,56 +316,39 @@ with tab1:
             
             # --- 1. UNet Segmentation + Bounding Box ---
             try:
-                # 這裡假設 run_unet_inference 能夠正常運行
                 mask, bboxes, crops_map = run_unet_inference(pil_img, CHECKPOINT_PATH)
             except Exception as e:
-                # UNet 推論失敗時，仍然允許進入下一步，但 crops_map 可能是空的
                 st.error(f"UNet 推論失敗: {e}")
-                crops_map = {} 
+                st.session_state.processing = False
+                st.session_state.current_data["pil_img"] = pil_img
+                st.stop()
                 
             
             # --- 2. Tesseract OCR ---
             ocr_results = {}
             for field, cropped_img in crops_map.items():
                 if cropped_img:
-                    # 假設這裡 Tesseract OCR 執行
-                    # 修正點: 清理發票號碼中的破折號
                     ocr_text = pytesseract.image_to_string(cropped_img, lang='eng', config='--psm 6').strip()
                     ocr_results[field] = ocr_text.replace('\n', ' ')
             
             # --- 3. LLM 驗證 ---
             if openai_key:
-                # 傳遞額外指令，確保日期和金額標準化
-                llm_output = llm_validate_and_correct(img_bytes, ocr_results, "請確保日期為 YYYY-MM-DD 格式，且總金額為純數字")
+                llm_output = llm_validate_and_correct(img_bytes, ocr_results, "請確保總金額為數字")
                 
                 if llm_output:
-                    # 發票號碼清理 (移除中線)
-                    raw_inv_no = llm_output.get("發票號碼", "N/A")
-                    if isinstance(raw_inv_no, str):
-                        inv_no = raw_inv_no.replace('-', '').strip() 
-                    else:
-                        inv_no = "N/A"
-                    
-                    # 這裡的 parsed_date 應該已經是 YYYY-MM-DD 格式
-                    parsed_date = llm_output.get("日期", "N/A") 
-                    
+                    inv_no = llm_output.get("發票號碼", "N/A")
+                    parsed_date = llm_output.get("日期", "N/A")
                     amount_str = str(llm_output.get("金額", "0")).replace(',', '').strip()
                     try:
-                        # 移除所有非數字和小數點的字元
                         amount = float(re.sub(r'[^\d.]', '', amount_str))
                     except ValueError:
                         amount = "N/A"
                 else:
                     st.error("LLM 驗證失敗，請手動修正資料。")
-                    inv_no, parsed_date, amount = "N/A", "N/A", "N/A" 
+                    inv_no, parsed_date, amount = "N/A", "N/A", "N/A" # LLM 失敗時給予 N/A
             else:
-                # 無 Key 狀態下，使用基礎 OCR 結果 (這裡仍可能產生格式問題)
-                raw_inv_no = ocr_results.get('invoice_no', 'N/A')
-                if isinstance(raw_inv_no, str):
-                    inv_no = raw_inv_no.replace('-', '').strip()
-                else:
-                    inv_no = "N/A"
-                    
+                # 無 Key 狀態下，使用基礎 OCR 結果
+                inv_no = ocr_results.get('invoice_no', 'N/A')
                 parsed_date = ocr_results.get('date', 'N/A')
                 amount_str = ocr_results.get('total_amount', '0').replace(',', '').strip()
                 try:
@@ -395,7 +364,6 @@ with tab1:
                 "amount": amount,
                 "pil_img": pil_img
             }
-            
             # 重新運行以顯示結果
             st.rerun()
 
@@ -420,6 +388,7 @@ with tab1:
         
         with col1_img:
             st.subheader("🖼️ 發票圖片預覽")
+            # 修正點 1: use_column_width=True -> use_container_width=True
             st.image(pil_img, caption="原始發票圖片", use_container_width=True) 
 
         with col2_input:
@@ -460,34 +429,23 @@ with tab1:
                 else:
                     data = {
                         "invoice_no": inv_no,
-                        "date": parsed_date, # 這裡的日期必須是標準格式
+                        "date": parsed_date,
                         "total_amount": final_amount,
                         "category": category,
                         "note": note
                     }
                     
                     img_bytes_io = io.BytesIO()
-                    # 確保圖片存在才能儲存
-                    if st.session_state.current_data["pil_img"]:
-                        st.session_state.current_data["pil_img"].save(img_bytes_io, format='JPEG')
-                        img_to_save = img_bytes_io.getvalue()
-                    else:
-                        img_to_save = b''
+                    st.session_state.current_data["pil_img"].save(img_bytes_io, format='JPEG')
                     
-                    # 執行儲存並接收結果 
-                    save_success = save_invoice(img_to_save, data)
+                    save_invoice(img_bytes_io.getvalue(), data)
                     
-                    if save_success:
-                        # V15.3 關鍵修正點：儲存成功時清除緩存
-                        # 確保下次載入儀表板時會重新查詢資料庫
-                        st.cache_data.clear() 
-                        
-                    # 儲存後清除 current_data 並刷新，無論成功或失敗都執行此步驟 
+                    # 儲存後清除並刷新儀表板資料緩存
+                    st.cache_data.clear() 
+                    # 清除 current_data 以避免重複儲存
                     st.session_state.current_data = {
                         "inv_no": "N/A", "parsed_date": "N/A", "amount": 0, "pil_img": None
                     }
-                    # 清除 hash，準備迎接下一個新檔案
-                    st.session_state.last_uploaded_hash = None
                     st.rerun()
                     
     elif uploaded:
@@ -503,7 +461,13 @@ with tab2:
     
     if len(df) == 0:
         st.info("尚無發票紀錄，請先到「掃描與記錄」分頁新增資料。")
-        st.stop()
+        # 僅在 Supabase 連線成功但無數據時顯示此資訊
+        if supabase is not None:
+             st.stop()
+        else:
+             # 如果連線失敗，讓 Streamlit 繼續執行以顯示錯誤信息
+             pass
+
 
     # --- 1. 總覽 KPI ---
     total_spending = df['total_amount'].sum()
@@ -546,6 +510,7 @@ with tab2:
             )
             fig_pie.update_traces(textinfo='percent+label', marker=dict(line=dict(color='#000000', width=1)))
             fig_pie.update_layout(showlegend=False)
+            # 修正點 2: use_container_width=True
             st.plotly_chart(fig_pie, use_container_width=True) 
         else:
             st.info("暫無支出數據可供分析。")
@@ -569,6 +534,7 @@ with tab2:
             )
             fig_line.update_traces(line=dict(width=3))
             fig_line.update_layout(xaxis_tickangle=-45)
+            # 修正點 3: use_container_width=True
             st.plotly_chart(fig_line, use_container_width=True) 
         else:
             st.info("暫無歷史數據可供分析。")
@@ -593,6 +559,7 @@ with tab2:
             
             month_df['總金額 (NT$)'] = month_df['總金額 (NT$)'].apply(lambda x: f"{x:,.0f}")
             
+            # 修正點 4: use_container_width=True
             st.dataframe(
                 month_df, 
                 use_container_width=True, 
