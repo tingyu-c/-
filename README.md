@@ -95,7 +95,6 @@ cd invoice-ocr-system
 ```
 
 ### 2. Install dependencies
-（如需，我可以幫你產生 requirements.txt）
 
 ```bash
 pip install -r requirements.txt
