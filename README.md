@@ -1,7 +1,7 @@
-# 🧾 Taiwan E-Invoice OCR System  
+# 🧾 Taiwan Invoice OCR System  
 ### **UNet + OCR + LLM for Automatic Invoice Field Extraction**
 
-本專案實作一套 **台灣電子發票欄位自動擷取系統**，從原始影像到結構化 JSON 完全自動化。  
+本專案實作一套 **台灣發票欄位自動擷取系統**，從原始影像到結構化 JSON 完全自動化。  
 系統結合 **UNet 影像分割、Tesseract OCR、與 LLM 後處理**，可精準擷取：
 
 - **發票號碼（invoice_no）**  
