@@ -67,8 +67,8 @@ TESSERACT_PATH = auto_set_tesseract_path()
 # ------------------------------------------------------------
 # 🚨 請在這裡填入您的 Supabase 專案資訊
 SUPABASE_URL = "https://tervudnniyobpeancuhj.supabase.co" # 替換為您的專案 URL
-# 使用 Service Role Key 進行後端操作
-SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRlcnZ1ZG5uaXlvYnBlYW5jdWhqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDA0MTgyNCwiZXhwIjoyMDc5NjE3ODI0fQ.xPUQ6yq0OpkmLzzApMRc-uKyYyKwDqHOd5RcATO_xBY" 
+# 使用 Service Role Key 進行後端操作(自行輸入
+SERVICE_ROLE_KEY = " " 
 TABLE_NAME = "invoices_data" # 確保此名稱與您在 Supabase 中建立的表格名稱完全一致
 
 @st.cache_resource
@@ -572,3 +572,4 @@ with tab2:
                     )
                 }
             )
+
