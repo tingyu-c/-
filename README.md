@@ -32,7 +32,7 @@ Taiwan E-Invoice OCR System
        └── 輸出結構化 JSON
 ```
 
-（使用「純文字架構圖」確保在 GitHub 不會跑版）
+
 
 ---
 
