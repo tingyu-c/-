@@ -137,14 +137,6 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-或：
-
-```bash
-streamlit run app_v41.py
-```
-
-視你的版本而定。
-
 ---
 
 ## 7. 資料庫 Schema（Supabase）
