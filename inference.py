@@ -82,17 +82,28 @@ def crop_bbox(original_img, bbox):
     if bbox is None:
         return None
 
-    w, h = original_img.size     # 原圖大小
     x1, y1, x2, y2 = bbox
+    orig_w, orig_h = original_img.size
 
-    # 轉回原圖座標
-    x1 = int(x1 / IMG_SIZE * w)
-    x2 = int(x2 / IMG_SIZE * w)
-    y1 = int(y1 / IMG_SIZE * h)
-    y2 = int(y2 / IMG_SIZE * h)
+    # 正確縮放（這才是對的）
+    x1 = int(x1 * orig_w / IMG_SIZE)
+    x2 = int(x2 * orig_w / IMG_SIZE)
+    y1 = int(y1 * orig_h / IMG_SIZE)
+    y2 = int(y2 * orig_h / IMG_SIZE)
+
+    # 加上 10~15% padding + 邊界保護
+    pad_x = int((x2 - x1) * 0.15)
+    pad_y = int((y2 - y1) * 0.15)
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(orig_w, x2 + pad_x)
+    y2 = min(orig_h, y2 + pad_y)
+
+    # 最小尺寸保護
+    if x2 - x1 < 20 or y2 - y1 < 20:
+        return None
 
     return original_img.crop((x1, y1, x2, y2))
-
 
 # -----------------------------
 # 主流程：Segmentation + BBox + Crops
