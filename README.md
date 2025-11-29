@@ -1,261 +1,224 @@
-# 🧾 Taiwan Invoice OCR System  
-### **UNet + OCR + LLM for Automatic Invoice Field Extraction**
+🧾 發票記帳神器（Invoice Manager）
+UNet Segmentation + OCR + 全圖 QR 解碼 + GPT 修補 + Streamlit + Supabase
+Automatically extract Taiwanese electronic invoice fields & item details
+📌 專案簡介
 
-本專案實作一套 **台灣發票欄位自動擷取系統**，從原始影像到結構化 JSON 完全自動化。  
-系統結合 **UNet 影像分割、Tesseract OCR、與 LLM 後處理**，可精準擷取：
+這是一套 全自動化「台灣電子發票解析＋記帳系統」。
+只要上傳發票照片，就能自動：
 
-- **發票號碼（invoice_no）**  
-- **發票日期（date）**  
-- **總金額（total_amount）**
+辨識發票三大欄位
 
-我們團隊使用 Labelme 手動標註 **160 張台灣電子發票**，完成系統訓練與部署。
+發票號碼
 
----
+日期（自動轉民國 → 西元）
 
-## 📌 **Project Overview**
+總金額
 
-```
-Taiwan E-Invoice OCR System
-│
-├── 1️⃣ UNet Segmentation
-│      ├── invoice_no 區域
-│      ├── date 區域
-│      └── total_amount 區域
-│
-├── 2️⃣ OCR (Tesseract)
-│      └── 對各區域進行文字辨識
-│
-└── 3️⃣ LLM Post-processing
-       ├── 修正 OCR 錯字
-       ├── 格式化日期
-       ├── 金額合理性檢查
-       └── 輸出結構化 JSON
-```
+擷取 TEXT QR 內的品項、數量、單價
+
+旗標載具、贈品、點數，並自動過濾噪音字串
+
+將所有品項依比例調整金額（總額一致）
+
+存入 Supabase（主檔 + 子檔）
+
+以深色金融儀表板呈現每月花費與類別統計
+
+支援電腦版即時操作，也適合作為 Side Project 展示。
+
+🚀 Demo 功能展示
+✔ 上傳發票 → 自動辨識
+
+支援任意拍攝角度
+
+自動辨識三大欄位
+
+TEXT QR 品項解析
+
+✔ 儀表板
+
+每月支出折線圖
+
+類別支出圓餅圖
+
+當月 KPI（成長率 / 最大支出類別）
+
+查看某月所有發票與品項
+
+一鍵刪除發票（含所有子項）
+
+🧠 系統架構總覽
+📸 圖片上傳
+       ↓
+UNet Segmentation（可選） — (PyTorch)
+       ↓
+OCR (Tesseract) + GPT-4o-mini fallback
+       ↓
+全圖 QR 偵測（pyzxing + OpenCV detectMulti）
+       ↓
+TEXT QR 品項解析器（多階段清洗 + 錯誤容忍）
+       ↓
+金額等比例調整（避免總額不一致）
+       ↓
+Supabase（PostgreSQL）
+       ↓
+Streamlit UI（深色專業風儀表板）
+
+🔍 核心技術亮點
+1️⃣ UNet Segmentation（訓練代碼）
+
+為了解析發票位置，本專案提供完整 UNet 分割模型訓練流程：
+
+JSON → 彩色 mask（Labelme）
+
+PyTorch Dataset
+
+UNet (Encoder-Decoder)
+
+50 epochs 訓練
+
+模型儲存與可視化
+
+最後可切換是否使用 UNet (預設Unet)
+
+📄 程式碼：
+dataset.py 
+
+dataset
 
 
+train.py 
 
----
+train
 
-## 🚀 **Features**
 
-### ✔ UNet Segmentation  
-- 自行標註 160 張 Labelme polygon  
-- 模型輸出三種欄位的 segmentation mask  
-- 訓練期間自動可視化結果（true mask / pred mask）
+unet_model.py 
 
-### ✔ OCR Recognition  
-- 使用 **Tesseract OCR**  
-- 針對每個 Segmentation 區域裁切後辨識  
-- 大幅提升 OCR 精準度
+unet_model
 
-### ✔ LLM Post-processing  
-LLM 用於：
 
-- 修正 OCR 誤判（1/7、0/O 等）  
-- 日期補格式（例：`112/01/03` → `2023-01-03`）  
-- 金額數字清洗  
-- 輸出標準化 JSON
+inference.py 
 
-### ✔ Streamlit Web Demo  
-使用者可以：
+inference
 
-- 上傳發票  
-- 檢視 segmentation mask  
-- 檢視欄位裁切 crop  
-- 查看 OCR + LLM 的最終解析結果  
+2️⃣ OCR → GPT Fallback 校正
 
----
+使用 Tesseract OCR 抓取資訊，再由 GPT-4o-mini:
 
-## 📁 **Project Structure**
+自動補全錯誤辨識
 
-```
+解析日期格式
+
+自動抽取總金額
+
+回傳純 JSON
+
+保證三欄位一定存在
+
+3️⃣ 全圖 QR 偵測（雙引擎）
+
+pyzxing：精準強
+
+OpenCV detectAndDecodeMulti：輔助
+
+自動合併結果
+
+支援包含：
+
+TEXT QR（主要）
+
+載具 QR
+
+點數 QR
+
+亂碼 QR
+
+贈品 / 折抵 QR
+
+4️⃣ 強化 TEXT QR 品項解析器
+
+品項內容常見：
+
+**:泡菜豚中:1:155:海帶湯:1:35:...
+
+
+本專案處理：
+
+移除載具噪音、贈品欄位
+
+清洗特殊字元（※、＊、＠、＄）
+
+正規化品名
+
+合併同項目
+
+按金額排序
+
+金額自動調整到總額一致
+
+5️⃣ Supabase（PostgreSQL）資料庫設計
+
+主表：
+
+欄位	類型
+id (PK)	int8
+invoice_no	text
+date	text
+total_amount	float8
+category	text
+note	text
+
+子表（invoice_items）：
+
+欄位	類型
+item_id (PK, 自動遞增)	int8
+invoice_id (FK)	int8
+name	text
+qty	float8
+price	float8
+amount	float8
+6️⃣ Streamlit 深色儀表板 UI
+
+（含月支出折線圖、圓餅圖、KPI、發票細項、刪除功能）
+
+主要程式碼：
+app_v41.py / app_v42.py 
+
+app_v41
+
+📦 安裝與執行
+安裝依賴：
+pip install -r requirements.txt
+
+執行：
+streamlit run app.py
+
+🔧 專案結構
 invoice_project/
 │
-├── data/
-│   ├── images/          # 原始發票圖片
-│   ├── masks/           # 由 labelme JSON 轉換的 segmentation mask
+├── app.py                 # Streamlit 主程式
+├── inference.py           # UNet 推論流程
+├── train.py               # UNet 訓練
+├── dataset.py             # 資料集建立
+├── unet_model.py          # U-Net 架構
+├── json_to_mask.py        # 標註 JSON → 彩色 Mask
 │
-├── dataset.py           # PyTorch Dataset + augmentation
-├── json_to_mask.py      # JSON → mask 轉換工具
-├── train.py             # UNet 訓練（含可視化）
-├── unet_model.py        # UNet 模型結構
-├── inference.py         # Segmentation + OCR + LLM 推論
-├── app.py               # Streamlit Web App
-└── checkpoints/         # 模型權重
-```
+├── images/                # 原始影像
+├── masks/                 # 彩色 mask
+├── checkpoints/           # 模型儲存
+└── visualize/             # 訓練可視化
 
----
+🧪 未來可加入功能
 
-## 🛠️ **Installation**
+手機版前端（React Native / Flutter）
 
-### 1. Clone the repo
-```bash
-git clone https://github.com/<yourname>/invoice-ocr-system
-cd invoice-ocr-system
-```
+匯出 Excel / CSV
 
-### 2. Install dependencies
+每月預算、自動提醒
 
-```bash
-pip install -r requirements.txt
-```
+消費趨勢預測模型（Time-Series）
 
-### 3. Install Tesseract OCR（Windows）
-請安裝後確認路徑如下：
-
-```
-C:\Program Files\Tesseract-OCR\tesseract.exe
-```
-
----
-
-## 🎯 **Training UNet**
-
-```bash
-python train.py
-```
-
-訓練時會自動輸出：
-
-```
-visualize/
-  ├── epoch1_img.png
-  ├── epoch1_true_mask.png
-  └── epoch1_pred_mask.png
-```
-
-以及：
-
-```
-checkpoints/
-  ├── unet_epoch1.pth
-  ├── unet_epoch2.pth
-  └── best_unet_model.pth
-```
-
----
-
-## 🔍 **Run Inference**
-
-```bash
-python inference.py
-```
-
-輸出會包含：
-
-- segmentation mask  
-- bbox  
-- crop images  
-- OCR raw text  
-- LLM 修正後 JSON  
-
----
-
-## 🖥️ **Streamlit Web Demo**
-
-```bash
-streamlit run app.py
-```
-
-Demo 包含：
-
-- 上傳圖片  
-- 自動 segmentation  
-- OCR + LLM 結果  
-- 結構化資料顯示  
-
----
-
-## 📦 **Example Output**
-
-```json
-{
-  "invoice_no": "AB12345678",
-  "date": "2023-01-05",
-  "total_amount": 268
-}
-```
-## 📂 Dataset Availability
-
-本專案使用 **160 張台灣電子發票** 作為訓練資料，並由團隊自行使用  
-**Labelme** 進行欄位標註（invoice_no / date / total_amount）。
-
-由於資料中包含：
-
-- 真實店家名稱  
-- 發票號碼  
-- 購買日期與金額  
-- 可能涉及隱私或商業資訊  
-
-因此 **無法於 GitHub 公開整套完整資料集**。
-
-這也是許多包含實體文件、醫療資料、收據、票據的專案常見的限制。
-
-### 🔒 Why the dataset cannot be published?
-
-- 涉及真實消費資訊  
-- 屬於企業或個人票據資料  
-- 台灣發票屬於具隱私性文件，不適合公開大量原始影像  
-- 可能造成資料外洩與法規風險  
-
-基於以上原因，我們選擇不將完整 dataset 放上 GitHub。
+自動判斷店家屬性（NLP / Clustering）
 
 
-## 🔧 How to Train the Model?
-
-若您需要訓練自己的模型：
-
-1. 準備自己的台灣電子發票資料  
-2. 使用 Labelme 標註三個欄位：
-   - `invoice_no`
-   - `date`
-   - `total_amount`
-3. 使用本專案提供的工具：
-   - `json_to_mask.py`：將 Labelme JSON 轉換為 segmentation masks  
-   - `train.py`：進行 UNet 模型訓練  
----
-
-## 📬 Need the dataset?
-
-如需完整資料集進行研究用途，可透過 Issue 或 Email 與作者聯繫。  
-我們可提供資料格式範本、標註流程指南，但 **無法提供完整未遮蔽資料影像**。
----
-
-## 🧩 **Tech Stack**
-
-| Component | Technology |
-|----------|------------|
-| Segmentation | UNet (PyTorch) |
-| Annotation | Labelme |
-| OCR | Tesseract |
-| LLM | OpenAI / gpt-4.1-mini / GPT-5 |
-| Web UI | Streamlit |
-| Data Augmentation | Albumentations |
-
----
-
-## 🤝 **Contributions**
-
-歡迎提出 issue / PR！  
-如果你想新增：
-
-- YOLOv8 / YOLO-World for text detection  
-- OCR-free end-to-end 模型  
-- FastAPI REST API  
-- Cloud 部署（Railway / Render）  
-
-都非常歡迎。
-
----
-
-## 📄 License
-
-MIT License.
-
----
-
-## ⭐ Support
-
-如果這個專案對你有幫助，  
-請幫忙點個 ⭐️ 支持！
-
+歡迎提出 issue / PR，一起讓台灣發票 AI 更好用！
