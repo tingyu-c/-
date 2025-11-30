@@ -237,8 +237,5 @@ streamlit run app_v42.py
 
 MIT License
 
----
-
-
-只要回我說 **「我要美化版 README」** 或 **「我要雙語版 README」** 即可！
+--
 
