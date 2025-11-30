@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms as T
 
-from dataset import InvoiceSegDataset
+from dataset import InvoiceDataset
 from unet_model import UNet
 
 
@@ -59,11 +59,10 @@ def main():
     ])
 
     mask_transform = T.Compose([
-        T.Resize((512, 512), interpolation=T.InterpolationMode.NEAREST),
-        T.ToTensor(),                                      # 加上這行
+        T.Resize((512, 512), interpolation=T.InterpolationMode.NEAREST),                                     # 加上這行
     ])
 
-    dataset = InvoiceSegDataset(images_dir, masks_dir, transform, mask_transform)
+    dataset = InvoiceDataset(images_dir, masks_dir, transform, mask_transform)
     loader  = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=True)
 
     print(f"載入 {len(dataset)} 張訓練資料")
@@ -120,7 +119,7 @@ def main():
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, f"unet_epoch{epoch}.pth"))
 
     print("訓練完成！最佳模型在：checkpoints/best_unet_model.pth")
-    print("現在直接執行：streamlit run app.py 就能用了！")
+    print("現在直接執行：streamlit run app_v41.py 就能用了！")
 
 
 if __name__ == "__main__":
