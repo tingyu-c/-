@@ -1,265 +1,244 @@
-# 📄 發票記帳神器 — Invoice Manager (UNet + OCR + QR + GPT + Supabase)
+# 📘 發票記帳神器 v42
 
-> 自動讀取台灣電子發票｜UNet 區塊定位｜Tesseract OCR｜GPT 修補｜全圖 QR 抓取品項｜Supabase 雲端記帳儀表板
->
-> **支援：發票號碼、日期、總金額、自動品項解析、每月花費儀表板**
+**UNet Segmentation + OCR + GPT-4o-mini Fallback + QR 掃描 + Supabase 儲存**
 
----
+本專案提供一個 **全自動化的台灣電子發票辨識系統**：
+從一張圖片開始 → 自動找出欄位位置 → OCR → 修正常見錯誤 → 解析 TEXT QR → 儲存到雲端資料庫 → 並提供完整儀表板分析。
 
-## 🚀 功能特色
+支援：
 
-### 🧠 1. UNet 發票欄位定位（深度學習）
-
-模型可自動從完整發票圖片中定位：
-
-* `invoice_no`（發票號碼）
-* `date`（日期）
-* `total_amount`（總金額）
-
-使用 **UNet 512×512 segmentation**，你可在 `/checkpoints/best_unet_model.pth` 載入最佳模型。
-模型結構：純 PyTorch、無 SPM 依賴
-（檔案：[`unet_model.py`](./unet_model.py)）
-
----
-
-### 🔍 2. OCR + GPT fallback
-
-* 主要 OCR：Tesseract (`chi_tra+eng`)
-* 辨識失敗 → 自動轉用 GPT-4o-mini 圖像辨識補齊（只回 JSON）
-
-對於模糊、旋轉、印刷不清的發票非常有用。
-（檔案：[`app_v41.py` / extract_invoice_meta](./app_v41.py)）
-
----
-
-### 📦 3. 全圖 QR 掃描（品項自動解析）
-
-同時支援：
-
-* pyzxing（主要）
-* OpenCV QRCodeDetector（備援）
-
-自動解析餐飲業常見 **TEXT QR**，取得：
-
-* 品名
-* 數量
-* 單價
-* 自動等比例調整金額 → 使合計與發票總額一致
-
-（功能檔案：`parse_text_qr_items()`、`detect_invoice_items()`）
-（來源：[`app_v41.py`](./app_v41.py)）
-
----
-
-### 🗄 4. Supabase 雲端記帳系統
-
-自動寫入：
-
-* `invoices_data`（發票主檔）
-* `invoice_items`（品項子檔）
-
-並提供：
-
-* 每月花費折線圖
-* 類別圓餅圖
-* 當月 KPI（最高花費類別 / 成長率）
-* 依月份檢索
-* 點開單張發票查看細項
-* 一鍵刪除（含所有品項）
-
----
-
-### 🖥 5. 完整 Streamlit 介面
-
-分成兩大分頁：
-
-#### 📤 Tab 1 — 上傳與辨識
-
-* 顯示原始影像
-* UNet + OCR + GPT 結果
-* TEXT QR 品項表格
-* 類別 / 備註
-* 儲存至資料庫
-
-#### 📊 Tab 2 — 儀表板
-
-* 每月花費、成長率、最大類別
-* 月份切換
-* 圖表視覺化
-* 發票與品項清單
-
-主要 UI 在：[`app_v41.py`](./app_v41.py)（中後段）
+* 🟥 **發票號碼 segmentation（UNet）**
+* 🟩 **日期 segmentation（UNet）**
+* 🟦 **總金額 segmentation（UNet）**
+* 🔍 **Tesseract OCR**
+* 🤖 **GPT-4o-mini fallback（OCR 錯誤自動修正）**
+* 🧾 **TEXT QR 全圖掃描與品項解析**
+* 🗄 **Supabase 資料庫儲存**
+* 📊 **Streamlit 儀表板**
+* 📤 **一鍵匯出與統計報表**
 
 ---
 
 ## 📁 專案結構
 
 ```
-invoice_project/
+project/
 │
-├── app_v41.py              # Streamlit 主程式
-├── inference.py            # UNet 推論流程（mask → bbox → crop）:contentReference[oaicite:4]{index=4}
-├── unet_model.py           # PyTorch UNet 模型定義    :contentReference[oaicite:5]{index=5}
-├── train.py                # 模型訓練程式（含 visualize）:contentReference[oaicite:6]{index=6}
-├── dataset.py              # 資料集格式 + color mask → class mask:contentReference[oaicite:7]{index=7}
-├── json_to_mask.py         # 將 Labelme JSON → 彩色 mask.png 生成器:contentReference[oaicite:8]{index=8}
+├── app_v42.py                          # Streamlit 主程式（上傳/辨識/儀表板）
 │
-├── images/                 # 原始訓練圖片
-├── masks/                  # 彩色 segmentation masks
-├── checkpoints/            # best_unet_model.pth 儲存位置
-└── visualize/              # 訓練過程產生的可視化
+├── train.py                             # UNet 訓練（Dice+Focal + bias init）
+├── unet_model.py                        # UNet 架構（3-channel multi-label）
+├── dataset.py                           # Dataset（讀 fixed_images + fixed_masks）
+├── inference.py                         # segmentation 推論 + bbox 回推
+│
+├── rescue_masks_from_json_final.py      # 自動修復 LabelMe JSON mask → (H,W,3)
+│
+├── fixed_images/                        # 統一尺寸圖片
+├── fixed_masks/                         # (H,W,3) 多標籤 segmentation mask (.npy)
+├── checkpoints/
+│   └── best_unet.pth                   # 訓練最佳模型
+│
+└── visualize/                           # 每個 epoch 的 segmentation 可視化
 ```
 
 ---
 
-## 🛠 安裝與環境設定
+## 🧠 模型設計：UNet + Multi-Label Segmentation
 
-### 1. 安裝套件
+本專案採用 **3-channel multi-label segmentation**，
+每個通道代表一項欄位（可同時重疊，避免 cross-entropy 的壓制問題）。
 
-```bash
-pip install -r requirements.txt
-```
+| Channel | 欄位   | 顏色       |
+| ------- | ---- | -------- |
+| 0       | 發票號碼 | 🟥 red   |
+| 1       | 日期   | 🟩 green |
+| 2       | 總金額  | 🟦 blue  |
 
-必要套件包含：
+Loss 採用：
 
-* streamlit
-* torch / torchvision
-* pytesseract
-* opencv-python
-* supabase
-* pyzxing
-* plotly
-* pillow
-* numpy
+* **DiceLoss 0.85**
+* **FocalLoss 0.15（正樣本權重 α=0.8）**
 
-### 2. Windows Tesseract 路徑
+適用於：
 
-```python
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-```
+* 小文字 segmentation
+* 佔畫面僅 0.1%–1% 的極小區域
+* 背景佔比極大（>99% 的 pixel）
 
 ---
 
-## 📘 資料集準備（UNet 訓練）
+## 🛠 訓練：train.py
 
-### Step 1 — 使用 LabelMe 標註 polygon
-
-三種類別：
-
-| Label        | Color (RGB) |
-| ------------ | ----------- |
-| invoice_no   | (255, 0, 0) |
-| date         | (0, 255, 0) |
-| total_amount | (0, 0, 255) |
-
-### Step 2 — 轉成 mask
-
-```bash
-python json_to_mask.py
 ```
-
-會在 `/masks/` 自動生成彩色 segmentation mask。
-
-### Step 3 — 開始訓練
-
-```bash
 python train.py
 ```
 
-訓練完成後：
+訓練流程：
 
-```
-checkpoints/best_unet_model.pth
-```
+* 自動載入 `fixed_images/` 與 `fixed_masks/`
+* 多標籤 segmentation 訓練
+* 每個 epoch 可視化 true/pred mask
+* 自動保存最佳模型 `checkpoints/best_unet.pth`
 
 ---
 
-## 🔮 UNet 推論（含 bbox + OCR crop）
+## 🧼 標註與 Mask 修復（必做）
 
-範例：
+使用 LabelMe 標註後，請執行以下腳本將 JSON → (H,W,3) segmentation mask：
 
-```python
-from PIL import Image
-from inference import run_unet_inference
-
-img = Image.open("invoice.jpg").convert("RGB")
-mask, bboxes, crops = run_unet_inference(img, "checkpoints/best_unet_model.pth")
+```
+python rescue_masks_from_json_final.py
 ```
 
 輸出：
 
-* `mask`：512×512 類別矩陣
-* `bboxes`：各欄位的 bounding boxes
-* `crops`：切好的「發票號碼」、「日期」、「總金額」影像（可直接餵 OCR）
+* `fixed_images/xxx.jpg`
+* `fixed_masks/xxx.npy`（三通道 mask）
 
-來源：[`inference.py`](./inference.py)
+這是 UNet 訓練的唯一正確格式。
 
 ---
 
-## 🧩 Streamlit 使用方式
+## 🔍 推論：inference.py
 
-### 啟動 APP
+使用 segmentation 推論 + OCR 切圖：
 
-```bash
-streamlit run app_v41.py
+```python
+from inference import run_unet
+masks, crops = run_unet(pil_image, "checkpoints/best_unet.pth")
 ```
 
-頁面包含：
+各項裁切影像（可送入 OCR）：
 
-* 發票圖片預覽
-* UNet 分割結果
-* OCR（Tesseract + GPT 修復）
-* QR TEXT 品項解析
-* 金額等比例校正
-* 類別與備註輸入
-* Supabase 上傳 / 刪除功能
-* 每月儀表板與圓餅圖
+```python
+crops["invoice_no"]
+crops["date"]
+crops["total_amount"]
+```
 
 ---
 
-## 🗄 Supabase Schema
+## 🤖 OCR + GPT Fallback
 
-### invoices_data
+app 會使用：
 
-| 欄位           | 型態        |
-| ------------ | --------- |
-| id           | bigint PK |
-| invoice_no   | text      |
-| date         | date      |
-| total_amount | float     |
-| category     | text      |
-| note         | text      |
+1. **UNet 找出欄位位置**
+2. **Tesseract OCR 辨識**
+3. 若未成功 → 自動啟動 **GPT-4o-mini（圖片 + 欄位）** 補齊欄位
 
-### invoice_items
+GPT 回傳格式：
 
-| 欄位         | 型態        |
-| ---------- | --------- |
-| id         | bigint PK |
-| invoice_id | fk        |
-| name       | text      |
-| qty        | float     |
-| price      | float     |
-| amount     | float     |
+```json
+{
+  "invoice_no": "AB12345678",
+  "date": "2025-01-10",
+  "total_amount": "520"
+}
+```
 
 ---
 
-## 🎯 Roadmap
+## 🧾 TEXT QR 掃描與品項解析
 
-* [ ] 手機版 UI
-* [ ] 自動同步載具發票
-* [ ] 自動行程消費分類（AI）
-* [ ] OCR 景深模糊修正
-* [ ] 導入更強 segmentation backbone
+使用：
+
+* `pyzxing`（主力）
+* `OpenCV detectAndDecodeMulti`（備援）
+
+可支援：
+
+* 超髒亂 TEXT QR
+* 載具碼 / 品項 / 加購 / 贈品 / 小計
+* 自動清洗：過濾噪音、合併相同品名、數量/單價推算
+* 最終金額以總額 → **等比例調整**
+
+輸出：
+
+| name | qty | price | amount |
+| ---- | --- | ----- | ------ |
 
 ---
 
-## 📜 License
+## 💾 Supabase 儲存
 
-This project is open-source under MIT License.
+儲存兩個表：
 
+### `invoices_data`
+
+| 欄位           | 說明   |
+| ------------ | ---- |
+| invoice_no   | 發票號碼 |
+| date         | 日期   |
+| total_amount | 總金額  |
+| category     | 類別   |
+| note         | 備註   |
+
+### `invoice_items`
+
+| 欄位         | 說明   |
+| ---------- | ---- |
+| invoice_id | 主檔連結 |
+| name       | 品名   |
+| qty        | 數量   |
+| price      | 單價   |
+| amount     | 小計   |
 
 ---
 
-歡迎提出 Issue / PR。
+## 📊 儀表板功能（Tab 2）
+
+包含：
+
+* 當月支出
+* 月成長率
+* 本月最大類別
+* 各類別圓餅圖
+* 月支出折線圖
+* 特定月份檢視
+* 發票明細列表
+* 一鍵刪除發票（含子項目）
 
 ---
+
+## 🚀 部署
+
+### 1. 安裝依賴：
+
+```
+pip install -r requirements.txt
+```
+
+### 2. 設定 Streamlit secrets (`.streamlit/secrets.toml`)
+
+```
+SUPABASE_URL="https://xxxxx.supabase.co"
+SUPABASE_KEY="your_anon_key"
+```
+
+### 3. 啟動 App
+
+```
+streamlit run app_v42.py
+```
+
+---
+
+## 🗺 Roadmap
+
+* [ ] 加入手機拍照自動裁切（Perspective transform）
+* [ ] 加入 RNN/Transformer OCR 替代 Tesseract
+* [ ] 發票載具自動對帳
+* [ ] 商家分類自動化（AI 分類器）
+* [ ] 內建多發票批次上傳
+
+---
+
+## 🪪 License
+
+MIT License
+
+---
+
+
+只要回我說 **「我要美化版 README」** 或 **「我要雙語版 README」** 即可！
+
