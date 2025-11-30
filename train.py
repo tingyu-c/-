@@ -1,125 +1,164 @@
+# train_v3.py
 import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 from PIL import Image
-import torchvision.transforms as T
 
 from dataset import InvoiceDataset
 from unet_model import UNet
 
 
-# ---------------------------- 可視化函式（彩色版）----------------------------
-def visualize_epoch(img, true_mask, pred_mask, save_prefix):
+# ===========================================================
+# Loss
+# ===========================================================
+class MultiLabelDiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred = pred.view(pred.size(0), pred.size(1), -1)
+        target = target.view(target.size(0), target.size(1), -1)
+
+        inter = (pred * target).sum(-1)
+        union = pred.sum(-1) + target.sum(-1)
+        dice = 1 - (2 * inter + self.smooth) / (union + self.smooth)
+        return dice.mean()
+
+
+class MultiLabelFocalLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred, target):
+        eps = 1e-7
+        pred = pred.clamp(eps, 1 - eps)
+
+        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        pt = torch.exp(-bce)
+        loss = self.alpha * (1 - pt) ** self.gamma * bce
+        return loss.mean()
+
+
+class InvoiceLoss(nn.Module):
+    def __init__(self, dice_weight=0.85, focal_weight=0.15, focal_alpha=0.8, gamma=2.0):
+        super().__init__()
+        self.dice = MultiLabelDiceLoss()
+        self.focal = MultiLabelFocalLoss(alpha=focal_alpha, gamma=gamma)
+        self.dw = dice_weight
+        self.fw = focal_weight
+
+    def forward(self, pred, target):
+        pred = torch.sigmoid(pred)
+        return self.dw * self.dice(pred, target) + self.fw * self.focal(pred, target)
+
+
+# ===========================================================
+# Visualization
+# ===========================================================
+def visualize(img, true_mask, pred_prob, name):
     os.makedirs("visualize", exist_ok=True)
 
-    # 反正規化 ImageNet
-    inv_normalize = T.Normalize(
-        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
-        std=[1/0.229, 1/0.224, 1/0.225]
-    )
-    img = inv_normalize(img.clone())
-    img = torch.clamp(img, 0, 1)
-    img_np = (img.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-    Image.fromarray(img_np).save(f"visualize/{save_prefix}_img.png")
+    img_np = (img.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
+    Image.fromarray(img_np).save(f"visualize/{name}_img.png")
 
-    # 彩色遮罩（紅=invoice_no, 綠=date, 藍=total_amount）
-    def mask_to_color(mask_tensor):
-        mask = mask_tensor.cpu().numpy()
-        color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-        color[mask == 1] = [255, 0, 0]    # 紅色
-        color[mask == 2] = [0, 255, 0]    # 綠色
-        color[mask == 3] = [0, 0, 255]    # 藍色
-        return color
+    H, W = true_mask.shape[1:]
 
-    true_color = mask_to_color(true_mask)
-    pred_color = mask_to_color(pred_mask)
+    # True mask
+    t = true_mask.cpu().numpy()
+    true_color = np.zeros((H, W, 3), dtype=np.uint8)
+    true_color[t[0] > 0.5] = [255,0,0]
+    true_color[t[1] > 0.5] = [0,255,0]
+    true_color[t[2] > 0.5] = [0,0,255]
+    Image.fromarray(true_color).save(f"visualize/{name}_true.png")
 
-    Image.fromarray(true_color).save(f"visualize/{save_prefix}_true.png")
-    Image.fromarray(pred_color).save(f"visualize/{save_prefix}_pred.png")
+    # Predicted mask
+    p = (pred_prob.cpu().numpy() > 0.3)
+    pred_color = np.zeros((H, W, 3), dtype=np.uint8)
+    pred_color[p[0]] = [255,0,0]
+    pred_color[p[1]] = [0,255,0]
+    pred_color[p[2]] = [0,0,255]
+    Image.fromarray(pred_color).save(f"visualize/{name}_pred.png")
 
 
-# ---------------------------- 主程式 ----------------------------
+# ===========================================================
+# Training Main
+# ===========================================================
 def main():
-    images_dir = "images"
-    masks_dir   = "masks"          # 這裡一定要是放「彩色 mask」的地方！
-    checkpoint_dir = "checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"使用裝置: {device}")
+    print("Using device:", device)
 
-    # 跟 inference.py 完全一致：512x512
-    transform = T.Compose([
-        T.Resize((512, 512)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    # Dataset
+    dataset = InvoiceDataset("fixed_images", "fixed_masks")
+    loader = DataLoader(dataset, batch_size=4, shuffle=True)
+    print("Total training samples:", len(dataset))
 
-    mask_transform = T.Compose([
-        T.Resize((512, 512), interpolation=T.InterpolationMode.NEAREST),                                     # 加上這行
-    ])
+    # Model
+    model = UNet(n_channels=3, n_classes=3).to(device)
 
-    dataset = InvoiceDataset(images_dir, masks_dir, transform, mask_transform)
-    loader  = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=True)
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d) and m.out_channels == 3:
+            nn.init.constant_(m.bias, -4.0)
+            print("已初始化 UNet 最終層 bias = -4.0（預設強烈偏向背景）")
 
-    print(f"載入 {len(dataset)} 張訓練資料")
+    # Loss + Optimizer + Scheduler
+    criterion = InvoiceLoss(
+        dice_weight=0.85,
+        focal_weight=0.15,
+        focal_alpha=0.80,
+        gamma=2.0
+    )
 
-    if len(dataset) == 0:
-        print("資料集為空！請先執行 json_to_mask.py 產生彩色 mask")
-        return
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    model = UNet(n_channels=3, n_classes=4).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)  # 更穩
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2
+    )
 
-    epochs = 50
-    best_loss = float('inf')
+    os.makedirs("checkpoints", exist_ok=True)
+    best_loss = 999
 
-    print("開始訓練！每 epoch 會存 visualize 圖片在 visualize/ 資料夾\n")
-
-    for epoch in range(1, epochs + 1):
+    # Training Loop
+    for epoch in range(1, 51):
         model.train()
-        epoch_loss = 0
+        total_loss = 0
 
-        for i, (imgs, masks) in enumerate(loader):
-            imgs  = imgs.to(device)
-            masks = masks.to(device).long()  # 必須是 long
+        for i, (img, mask) in enumerate(loader):
+            img  = img.to(device)
+            mask = mask.to(device)
 
-            preds = model(imgs)              # (N, 4, 512, 512)
-            loss  = criterion(preds, masks)
+            logits = model(img)
+            loss = criterion(logits, mask)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            total_loss += loss.item()
 
-            # 每 batch 第一張都可視化（方便看進度）
+            # 可視化
             if i == 0:
-                pred_mask = torch.argmax(preds[0], dim=0)
-                visualize_epoch(imgs[0].cpu(), masks[0].cpu(), pred_mask, f"epoch{epoch:02d}")
+                pred_prob = torch.sigmoid(logits[0].detach())
+                visualize(img[0], mask[0], pred_prob, f"epoch{epoch:03d}")
 
-            print(f"Epoch {epoch:02d} [{i+1}/{len(loader)}] loss: {loss.item():.4f}")
+        avg = total_loss / len(loader)
+        print(f"Epoch {epoch} | Loss = {avg:.6f}")
 
-        avg_loss = epoch_loss / len(loader)
-        print(f"\nEpoch {epoch:02d} 完成！平均 loss: {avg_loss:.4f}\n")
+        scheduler.step()
 
-        # 儲存最佳模型
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            path = os.path.join(checkpoint_dir, "best_unet_model.pth")
-            torch.save(model.state_dict(), path)
-            print(f"新的最佳模型已儲存！loss = {avg_loss:.4f}")
+        # Save best model
+        if avg < best_loss:
+            best_loss = avg
+            torch.save(model.state_dict(), "checkpoints/best_unet.pth")
+            print(">>> Best model updated!")
 
-        # 每 10 epochs 存一次備份
-        if epoch % 10 == 0 or epoch == epochs:
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, f"unet_epoch{epoch}.pth"))
-
-    print("訓練完成！最佳模型在：checkpoints/best_unet_model.pth")
-    print("現在直接執行：streamlit run app_v41.py 就能用了！")
+    print("Training Finished!")
 
 
 if __name__ == "__main__":
