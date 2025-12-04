@@ -1,5 +1,5 @@
 # ============================================================
-# app.py v42 — 發票記帳神器（UNet + OCR + 全圖QR + GPT Fallback + Supabase）
+# app.py — 發票記帳神器（UNet + OCR + 全圖QR + GPT Fallback + Supabase）
 # ============================================================
 import os
 import io
@@ -12,25 +12,304 @@ from PIL import Image
 import streamlit as st
 import pandas as pd
 import cv2
-import pytesseract
 from supabase import create_client
 import openai
 import plotly.express as px
+from typing import Dict
+from PIL import Image
+import numpy as np
+from openai import OpenAI
+from collections import Counter
+import time
+import pandas as pd
+import tempfile
+from datetime import datetime
 
+# ========= 全域 EasyOCR Reader（只初始化一次，速度提升 10 倍） =========
+import easyocr
+from pyzxing import BarCodeReader
+# 全域初始化（整個程式只跑一次，超快）
+zxing_reader = BarCodeReader()
+
+
+if "GLOBAL_EASYOCR_READER" not in st.session_state:
+    st.session_state.GLOBAL_EASYOCR_READER = easyocr.Reader(
+        ['en'], gpu=False  # 你沒有 GPU → 一定要設定 gpu=False
+    )
+
+reader = st.session_state.GLOBAL_EASYOCR_READER
+
+from pyzxing import BarCodeReader
+
+zxing_reader = BarCodeReader()
+
+
+def parse_left_qr(left_qr_text):
+    if not left_qr_text or ":" not in left_qr_text:
+        return {}
+
+    try:
+        body = left_qr_text.split(":")[0]
+
+        if len(body) < 37:
+            return {}
+
+        # 正確電子發票格式 offset（財政部規範）
+        inv_no = body[0:10]
+        roc_date = body[10:17]
+        random_code = body[17:21]
+
+        # 核心修正（Tammy 你現在最需要的）
+        sales_hex = body[21:29]      # 未稅金額 HEX
+        total_hex = body[29:37]      # 含稅金額 HEX ← 你抓錯位置在這！
+
+        # 日期：民國 → 西元
+        year = 1911 + int(roc_date[0:3])
+        month = int(roc_date[3:5])
+        day = int(roc_date[5:7])
+        date_str = f"{year:04d}-{month:02d}-{day:02d}"
+
+        total_amount = int(total_hex, 16)
+
+        return {
+            "invoice_no": inv_no,
+            "date": date_str,
+            "random_code": random_code,
+            "total_amount": str(total_amount)
+        }
+
+    except Exception as e:
+        st.warning(f"左 QR 解析錯誤：{e}")
+        return {}
+
+
+def parse_text_qr(text_qr):
+    """
+    解析右側 TEXT QR：
+    格式：
+        **:品名:數量:單價:品名:數量:單價...
+    """
+
+    if not text_qr or not text_qr.startswith("**"):
+        return []
+
+    # 乾淨化：去掉開頭 **
+    clean = text_qr.lstrip("*")
+    parts = clean.split(":")
+
+    # 去掉第一段空品名
+    parts = parts[1:] if parts and parts[0] == "" else parts
+
+    items = []
+    buf = []
+    for p in parts:
+        if re.match(r"^\d+(\.\d+)?$", p):
+            buf.append(p)
+        else:
+            # 遇到品名時重新起一段
+            buf.append(p)
+
+        # 每 3 個一組：品名、數量、價格
+        if len(buf) == 3:
+            name = buf[0]
+            qty = int(float(buf[1]))
+            price = int(float(buf[2]))
+            items.append({
+                "name": name,
+                "qty": qty,
+                "price": price,
+                "subtotal": qty * price
+            })
+            buf = []
+
+    return items
+
+def zxing_scan_raw(uploaded_file):
+    raw_bytes = uploaded_file.getvalue()
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as fp:
+        fp.write(raw_bytes)
+        temp_path = fp.name
+
+    result = reader.decode(temp_path)
+    return result
 
 
 # 🔧 全圖 QR 辨識
-from pyzxing import BarCodeReader
+from pyzbar.pyzbar import decode
 
-# ------------------------------
-# Tesseract for Windows
-# ------------------------------
-pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+def extract_from_qr_zxing(pil_img: Image.Image):
+    """
+    只做單張圖 pyzxing 解碼（不做多重增強）
+    回傳：list of raw_text（可能是多個 QR）
+    """
+
+    # 1. 先把 PIL 轉成暫存檔（pyzxing 必須吃檔案路徑）
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fp:
+        temp_path = fp.name
+        pil_img.save(temp_path)
+
+    # 2. pyzxing decode
+    try:
+        results = zxing_reader.decode(temp_path)
+    except Exception as e:
+        return []
+
+    if not results:
+        return []
+
+    # results 是 list of dict：{"raw": b"...", "text": "..."}
+    decoded_texts = []
+    for r in results:
+        raw = r.get("raw")
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8", errors="ignore")
+            except:
+                raw = ""
+        decoded_texts.append(raw)
+
+    return decoded_texts
+
+def clean_invoice_no(text: str) -> str:
+    """
+    清理 OCR 讀出來的發票號碼，例如：
+    - 移除空白與非字母數字
+    - 若格式正確（AA99999999）就輸出
+    """
+    if not text:
+        return ""
+
+    text = text.upper().strip()
+    text = re.sub(r"[^A-Z0-9]", "", text)
+
+    # 符合標準格式
+    if re.fullmatch(r"[A-Z]{2}\d{8}", text):
+        return text
+
+    return ""
+
+
+def clean_date(text: str) -> str:
+    """
+    嘗試把 OCR 讀出的日期格式化成 YYYY-MM-DD
+    支援：
+    - 2025/01/10
+    - 2025-1-5
+    - 2025.01.05
+    - 1140105（民國）
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # ---------- 民國格式（如 1140105）----------
+    if re.fullmatch(r"\d{7}", text):
+        try:
+            roc = int(text[:3]) + 1911
+            m = int(text[3:5])
+            d = int(text[5:7])
+            return f"{roc:04d}-{m:02d}-{d:02d}"
+        except:
+            pass
+
+    # ---------- 西元常見分隔符 ----------
+    text = text.replace(".", "-").replace("/", "-")
+    parts = text.split("-")
+
+    if len(parts) == 3:
+        try:
+            y = int(parts[0])
+            m = int(parts[1])
+            d = int(parts[2])
+            return f"{y:04d}-{m:02d}-{d:02d}"
+        except:
+            pass
+
+    # 其他無法解析
+    return ""
+
+
+def parse_qr_invoice(pil_img: Image.Image):
+    """
+    用 pyzbar 找左右 → 用 pyzxing 解內容
+    """
+    import numpy as np, cv2
+
+    img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    # 1. pyzbar 取位置
+    qrs = decode(img)
+    if not qrs:
+        return "", ""
+
+    # 取出 (x, raw_text)
+    qr_boxes = []
+    for q in qrs:
+        x = q.rect.left
+        txt = q.data.decode("utf-8", errors="ignore").strip()
+        qr_boxes.append((x, txt))
+
+    qr_boxes.sort(key=lambda z: z[0])  # ← 左右排序
+
+    # 2. pyzxing 取內容（多重影像增強）
+    zx_texts = extract_from_qr_zxing(pil_img)
+
+    # 配對 raw_text → 特徵修正
+    def best_match(raw):
+        # TEXT QR（右）判斷：包含品項格式
+        if raw.startswith("**") or ":" in raw:
+            return raw
+
+        # raw 太短或破損 → 用 zx 內容補
+        for zx in zx_texts:
+            if zx and zx != raw:
+                return zx
+
+        return raw
+
+    if len(qr_boxes) == 1:
+        return best_match(qr_boxes[0][1]), ""
+
+    left_qr  = best_match(qr_boxes[0][1])
+    right_qr = best_match(qr_boxes[1][1])
+
+    return left_qr, right_qr
+
+def clean_invoice_no(raw: str) -> str:
+    """清洗 OCR or GPT 的發票號碼，只保留 2 碼英文 + 8 碼數字"""
+    if not raw:
+        return ""
+
+    # 統一格式：去掉空白、奇怪符號
+    raw = raw.strip().upper()
+    raw = re.sub(r"[^A-Z0-9]", "", raw)
+
+    # 如果太短 → 直接回傳
+    if len(raw) < 10:
+        return raw
+
+    # 找 2 英文 + 8 數字 的 pattern
+    match = re.search(r"[A-Z]{2}\d{8}", raw)
+    if match:
+        return match.group(0)
+
+    # 找不到 → 最後嘗試強制切割前 10 碼
+    return raw[:10]
+
 
 # ------------------------------
 # Layout
 # ------------------------------
-st.set_page_config(page_title="發票記帳神器 v42", layout="wide")
+st.set_page_config(page_title="發票記帳神器", layout="wide")
+# === 背景儲存狀態初始化 ===
+if "save_status" not in st.session_state:
+    st.session_state.save_status = "idle"      # idle / saving / success / error
+if "last_save_time" not in st.session_state:
+    st.session_state.last_save_time = None
+if "last_error" not in st.session_state:
+    st.session_state.last_error = ""
 
 # ------------------------------
 # Sidebar：API Key 設定
@@ -45,7 +324,7 @@ else:
 # ------------------------------
 # Import UNet inference
 # ------------------------------
-from inference import run_unet_inference
+from inference import run_unet
 
 # ============================================================
 # Supabase 初始化
@@ -63,29 +342,121 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     st.sidebar.warning("尚未設定 Supabase secrets")
 
+def extract_invoice_meta(uploaded_file, pil_img, checkpoint_path, apikey):
 
-# ============================================================
-# Part 2 — UNet → OCR → GPT fallback 修正
-# ============================================================
 
-# ------------------------------
-# OCR：Tesseract
-# ------------------------------
-def ocr_text(pil_img):
-    """使用 Tesseract OCR 讀取裁切影像"""
+    meta = {"invoice_no": "", "date": "", "total_amount": ""}
+
+    # ============================================================
+    # Step 0：ZXing 掃描 左 / 右 QR（唯一正確方法）
+    # ============================================================
+    qr_left, qr_right = parse_qr_invoice(pil_img)
+
+
+    st.subheader("🔍 QR Debugger")
+    st.write("📎 左 QR:", qr_left)
+    st.write("📎 右 QR:", qr_right)
+
+    # ============================================================
+    # Step 1：UNet Segmentation
+    # ============================================================
     try:
-        text = pytesseract.image_to_string(pil_img, lang="eng")
-        return text.strip()
-    except:
-        return ""
+        from inference import run_unet
+        masks, crops = run_unet(pil_img, checkpoint_path)
+    except Exception as e:
+        st.error(f"UNet 發生錯誤：{e}")
+        crops = {}
+
+    # ============================================================
+    # Step 2：GPT ROI 讀金額（ROI 最準 → 但仍低於左 QR）
+    # ============================================================
+    amount_crop = crops.get("total_amount")
+    gpt_roi_amount = ""
+
+    if amount_crop is not None:
+        gpt_roi_amount = gpt_read_amount_from_roi(apikey, amount_crop)
+
+        if gpt_roi_amount.isdigit():
+            meta["total_amount"] = gpt_roi_amount
+            st.success(f"✔ 使用 GPT ROI 金額：{gpt_roi_amount}")
+        else:
+            st.warning("⚠ GPT ROI 金額失敗")
+
+    # ============================================================
+    # Step 3：解析左 QR（金額 100% 正確 → 永遠最高優先）
+    # ============================================================
+    info_left = parse_left_qr(qr_left)
+
+    if info_left.get("total_amount"):
+        meta["invoice_no"] = info_left.get("invoice_no", meta["invoice_no"])
+        meta["date"] = info_left.get("date", meta["date"])
+
+        # 左 QR 100% 最準 → 覆蓋 GPT ROI 金額
+        meta["total_amount"] = str(info_left["total_amount"])
+
+        st.success(f"✔ 使用 左 QR 金額（最高優先，最準確）：{meta['total_amount']}")
+    else:
+        st.warning("⚠ 左 QR 無法解析 → 使用下一順位")
+
+    # ============================================================
+    # Step 4：解析右 QR（TEXT QR 品項）
+    # ============================================================
+    items = parse_text_qr(qr_right)
+
+    if items:
+        sum_items = sum([it["subtotal"] for it in items])
+        st.write(f"📦 TEXT QR 品項加總：{sum_items}")
+
+        # 左 QR（或 GPT ROI）一致性檢查
+        if meta["total_amount"] and str(sum_items) == meta["total_amount"]:
+            st.info("✔ 右 QR 品項金額與左 QR 一致")
+        else:
+            st.warning("⚠ 右 QR 品項金額與左 QR 不一致")
+
+        # 若前面完全沒有金額 → 才用右 QR 金額
+        if not meta["total_amount"]:
+            meta["total_amount"] = str(sum_items)
+            st.success(f"✔ 使用右 QR 品項金額：{meta['total_amount']}")
+    else:
+        st.warning("⚠ TEXT QR 無品項或格式錯誤")
+
+    # ============================================================
+    # Step 5：OCR fallback（補 invoice_no / date）
+    # ============================================================
+        invoice_no_crop = crops.get("invoice_no")
+        date_crop = crops.get("date")
+        
+        # ---------- 補發票號碼 ----------
+        if not meta.get("invoice_no") and invoice_no_crop is not None:
+            try:
+                ocr_no = ocr_easy(invoice_no_crop)
+                meta["invoice_no"] = clean_invoice_no(ocr_no)
+            except Exception as e:
+                st.warning(f"OCR 發票號碼失敗：{e}")
+        
+        # ---------- 補日期 ----------
+        if not meta.get("date") and date_crop is not None:
+            try:
+                ocr_date = ocr_easy(date_crop)
+                meta["date"] = clean_date(ocr_date)
+            except Exception as e:
+                st.warning(f"OCR 日期失敗：{e}")
 
 
-# ------------------------------
-# GPT fallback：修正 OCR 錯誤
-# ------------------------------
-from openai import OpenAI
+    # ============================================================
+    # Step 6：GPT 全圖 fallback（不能覆蓋金額！）
+    # ============================================================
+    fixed = gpt_fix_ocr(apikey, pil_img, meta)
 
-from openai import OpenAI
+    meta["invoice_no"] = fixed.get("invoice_no", meta["invoice_no"])
+    meta["date"] = fixed.get("date", meta["date"])
+
+    # ============================================================
+    # Step 7：回傳結果
+    # ============================================================
+    return meta,  qr_left, qr_right
+
+
 
 def gpt_fix_ocr(api_key, pil_img, raw_ocr):
 
@@ -104,7 +475,7 @@ def gpt_fix_ocr(api_key, pil_img, raw_ocr):
 
 {
   "invoice_no": "...",
-  "date": "...",
+  "date": "...",只要年月日，民國改西元
   "total_amount": "..."
 }
 
@@ -128,7 +499,7 @@ def gpt_fix_ocr(api_key, pil_img, raw_ocr):
             ],
         )
 
-        reply = resp.choices[0].message["content"]
+        reply = resp.choices[0].message.content
 
         # --- 修正：reply 可能是 list ---
         if isinstance(reply, list):
@@ -156,129 +527,269 @@ def gpt_fix_ocr(api_key, pil_img, raw_ocr):
     except Exception as e:
         st.error(f"GPT fallback 錯誤：{e}")
         return raw_ocr
+    
+def gpt_read_amount_from_roi(api_key: str, roi_img: Image.Image) -> str:
+    if not api_key or roi_img is None:
+        return "0"
 
+    from openai import OpenAI
+    import cv2
+    import numpy as np
+    import base64
+    import io
+    import re
 
-# ------------------------------
-# 最終穩定版：UNet + pytesseract + GPT-4o-mini fallback
-# ------------------------------
-import io
-import json
-import base64
-import re
-import streamlit as st
-from PIL import Image
-import pytesseract
-import numpy as np
-from openai import OpenAI
+    client = OpenAI(api_key=api_key)
 
-# 設定 Tesseract 路徑（如果沒加環境變數才需要這行）
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    # ========= Step 1：保留原始細節，不做 dilate =========
+    img = np.array(roi_img.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-def ocr_with_tesseract(crop_pil: Image.Image) -> str:
-    """用 pytesseract 對裁剪區域做 OCR"""
-    if crop_pil is None:
-        return ""
-    try:
-        # 預處理：轉灰度 + 二值化 + 放大，提升辨識率
-        img = crop_pil.convert("L")
-        img = img.point(lambda x: 0 if x < 140 else 255, '1')  # 二值化
-        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-        
-        text = pytesseract.image_to_string(img, lang='chi_tra+eng', config='--psm 7')
-        return text.strip()
-    except:
-        return ""
+    # CLAHE
+    clahe = cv2.createCLAHE(clipLimit=12.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
 
-def extract_invoice_meta(pil_img: Image.Image, checkpoint_path: str, apikey: str = None):
-    meta = {"invoice_no": "", "date": "", "total_amount": ""}
+    # 各種版本
+    _, th1 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th2 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 31, 10)
+    inv1 = 255 - th1
+    inv2 = 255 - th2
 
-    # ===== Step 1：先用 UNet 分割 + pytesseract OCR =====
-    try:
-        from inference import run_unet_inference
-        _, _, crops = run_unet_inference(pil_img, checkpoint_path)
+    candidates = [enhanced, th1, th2, inv1, inv2]
+    best = candidates[np.argmin([np.mean(c) for c in candidates])]
 
-        # OCR 三個區域
-        invoice_text = ocr_with_tesseract(crops.get("invoice_no"))
-        date_text     = ocr_with_tesseract(crops.get("date"))
-        amount_text   = ocr_with_tesseract(crops.get("total_amount"))
+    h, w = best.shape
+    best_large = cv2.resize(best, (w*2, h*2), interpolation=cv2.INTER_CUBIC)
 
-        # 後處理：發票號碼
-        m = re.search(r"[A-Z]{2}[0-9]{8}", invoice_text.replace(" ", ""))
-        if m:
-            meta["invoice_no"] = m.group(0)
+    # ========= Step 2：轉 base64 給 GPT =========
+    buf = io.BytesIO()
+    Image.fromarray(best_large).save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        # 後處理：日期（民國 → 西元）
-        date_raw = re.sub(r"[^\d\/.-]", "", date_text)
-        if date_raw:
-            date_raw = date_raw.replace("113", "2024").replace("114", "2025").replace("112", "2023")
-            meta["date"] = date_raw[:10]
-
-        # 後處理：總金額
-        nums = re.findall(r"\d{3,}", amount_text.replace(",", ""))
-        if nums:
-            meta["total_amount"] = max(nums, key=len)
-
-        # 如果三個都拿到，就直接回傳
-        if all(meta.values()):
-            return meta
-        else:
-            st.warning("UNet + Tesseract 沒抓全，啟動 GPT-4o-mini 救場…")
-
-    except Exception as e:
-        st.warning(f"UNet 發生錯誤：{e}，改用 GPT 直接看圖")
-
-    # ===== Step 2：GPT-4o-mini 救場（只有真的需要才呼叫）=====
-    if not apikey:
-        st.info("無 OpenAI API Key，僅回傳 UNet 結果")
-        return meta
+    prompt = """請讀出總金額，只回傳純數字。
+只看冒號「:」右邊的第一組數字。
+如果看起來像 39 請回 39；不要回推估的字。
+"""
 
     try:
-        buf = io.BytesIO()
-        resized = pil_img.copy()
-        if max(resized.size) > 1600:
-            resized.thumbnail((1600, 1600))
-        resized.save(buf, format="PNG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        prompt = """這是一張台灣電子發票，請直接回傳純 JSON（不要任何說明）：
-{
-  "invoice_no": "10碼發票號碼，例如 AB12345678",
-  "date": "西元年-月-日，例如 2025-01-01",
-  "total_amount": "總金額純數字。前方會有"總計:"，例如 總計:520"
-}"""
-
-        client = OpenAI(api_key=apikey)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                ]
-            }],
-            temperature=0,
-            max_tokens=200
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        }
+                    ]
+                }
+            ],
+            max_tokens=10,
+            temperature=0.0
         )
-
         reply = response.choices[0].message.content.strip()
-        json_part = reply[reply.find("{"):reply.rfind("}")+1]
-        gpt_result = json.loads(json_part)
 
-        for k, v in gpt_result.items():
-            if v and not meta[k]:
-                meta[k] = str(v)
+        # 先找 冒號後面的
+        m = re.search(r'[:：]\s*(\d+)', reply)
+        if m:
+            return m.group(1)
 
-        st.success("GPT-4o-mini 成功補齊缺失欄位")
+        # fallback：純數字
+        digits = re.sub(r"[^\d]", "", reply)
+        if digits:
+            return digits
 
-    except Exception as e:
-        st.error(f"GPT 呼叫失敗：{e}")
+    except:
+        pass
 
+    return "0"
+
+# ------------------------------
+# 最終穩定版：UNet  + GPT-4o-mini fallback
+# ------------------------------
+
+
+reader_invoice = easyocr.Reader(['en'], gpu=False)   # 專抓英文數字
+reader_general = easyocr.Reader(['ch_tra','en'], gpu=False)
+
+
+def ocr_easy(img):
+    """
+    img 可以是 PIL Image 或 numpy array
+    EasyOCR 需要 numpy array (RGB)
+    """
+    # 如果是 PIL Image → 轉 numpy
+    if isinstance(img, Image.Image):
+        np_img = np.array(img.convert("RGB"))
+    else:
+        np_img = img
+
+    # EasyOCR 讀取
+    result = reader_invoice.readtext(np_img, detail=1)
+
+    # 把辨識結果接起來
+    text = "".join([r[1] for r in result])
+    return text.strip()
+
+
+def parse_invoice_date(date_crop):
+    if not date_crop:
+        return ""
+
+    np_img = np.array(date_crop)
+    raw_list = reader.readtext(np_img, detail=0)
+    raw = "".join(raw_list)
+    
+    raw_clean = raw.replace("年", "-").replace("月", "-").replace("日", "")
+    raw_clean = raw_clean.replace("/", "-").replace(".", "-").replace(" ", "")
+
+    # 抓出所有數字
+    nums = re.findall(r"\d+", raw_clean)
+
+    # ----------------------------------------
+    # 1) 民國年（3 位數）→ 西元
+    # ----------------------------------------
+    if len(nums) >= 3 and len(nums[0]) == 3:     # 例如 114-07-08
+        y = int(nums[0]) + 1911
+        m = int(nums[1])
+        d = int(nums[2])
+        return f"{y:04d}-{m:02d}-{d:02d}"
+
+    # ----------------------------------------
+    # 2) 西元年（4 位數，包含被 OCR 搞壞的）
+    # ----------------------------------------
+    m = re.search(r"(\d{4})[-]?(\d{1,2})[-]?(\d{1,2})", raw_clean)
+    if m:
+        y, mm, dd = map(int, m.groups())
+
+        # ---------- 年份修復邏輯 ----------
+        # 台灣電子發票年份落在 2010~2035
+        if not (2010 <= y <= 2035):
+            y_str = str(y)
+            # 最強修復法：把「20」固定好
+            y_str = "20" + y_str[2:]  # 2116 → 2016，2076 → 2076
+            y = int(y_str)
+
+            # 若仍不合理，強制拉回目前世代（2020~2026）
+            if y < 2010 or y > 2035:
+                y = 2020 + (y % 10)
+
+        # 月/日修復（避免 23月 88日）
+        mm = max(1, min(mm, 12))
+        dd = max(1, min(dd, 31))
+
+        return f"{y:04d}-{mm:02d}-{dd:02d}"
+
+    return ""
+
+# ============================================================
+# 備援函數：當 QR 完全失效時，用 UNet + OCR 強行救回
+# ============================================================
+def extract_from_crops_ocr(crops: dict) -> dict:
+    """
+    V42 — 最終穩定金額 OCR（與 Debug 模式一致）
+    整合發票號碼、日期、金額三區塊的純 OCR 備援
+    """
+    meta = {"invoice_no": "", "date": "", "total_amount": ""}
+
+    # ================== 發票號碼 ==================
+    inv_crop = crops.get("invoice_no")
+    if inv_crop is not None:
+        pad = 30
+        np_img = cv2.copyMakeBorder(
+            np.array(inv_crop),
+            top=10, bottom=10,
+            left=pad, right=pad + 20,
+            borderType=cv2.BORDER_CONSTANT,
+            value=[255, 255, 255]
+        )
+        result = reader.readtext(np_img, detail=1, 
+                                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-—– ')
+        texts = [r[1].upper() for r in result]
+        raw_text = " ".join(texts)
+
+        oracle_fix = str.maketrans({
+            "亍":"7","丂":"7","丁":"7","了":"7","丄":"7",
+            "工":"1","丨":"1","Ｏ":"O","０":"0",
+            "－":"-","—":"-","–":"-"," ":""
+        })
+        text_fixed = raw_text.translate(oracle_fix)
+
+        patterns = [
+            r"[A-Z]{2}[\s—–-]*\d{8}",
+            r"[A-Z]{2}\s*\d{8}",
+            r"[A-Z]{2}\d{8}",
+            r"\d{8}[A-Z]{2}",
+        ]
+        invoice_num = None
+        for pat in patterns:
+            m = re.search(pat, text_fixed)
+            if m:
+                clean = re.sub(r"[^A-Z0-9]", "", m.group(0))
+                if len(clean) == 10 and clean[:2].isalpha() and clean[2:].isdigit():
+                    invoice_num = clean
+                    break
+
+        if not invoice_num:
+            heads = re.findall(r"[A-Z]{2}", text_fixed)
+            head = heads[0] if heads else "XX"
+            digits = "".join(re.findall(r"\d", text_fixed))
+            if len(digits) >= 6:
+                num_part = (digits[:8] + "77").ljust(8, "7")[:8]
+                invoice_num = head + num_part
+
+        if invoice_num:
+            meta["invoice_no"] = invoice_num
+
+    # ================== 日期 ==================
+    date_crop = crops.get("date")
+    if date_crop is not None:
+        text = reader.readtext(np.array(date_crop), detail=0)
+        raw = " ".join(text)
+
+        cleaned = raw.upper()
+        cleaned = cleaned.replace("O","0").replace("I","1").replace("C","0")\
+                        .replace("S","5").replace("G","6").replace("Z","2")\
+                        .replace("B","8").replace("o","0").replace(".","-")
+        cleaned = re.sub(r"[^\d\-\/]", "", cleaned)
+
+        patterns = [
+            r"\d{4}[-/]\d{1,2}[-/]\d{1,2}",
+            r"\d{7,8}",
+            r"\d{2,3}[-/]\d{1,2}[-/]\d{1,2}",
+        ]
+        for p in patterns:
+            m = re.search(p, cleaned)
+            if m:
+                dt = m.group(0).replace("/", "-")
+                digits = dt.replace("-", "")
+                if len(digits) == 7:
+                    roc = int(digits[:3])
+                    dt = f"{roc + 1911}-{digits[3:5]}-{digits[5:]}"
+                meta["date"] = dt
+                break
+
+    # ================== 金額（無需 Tesseract 版本） ==================
+        amount_crop = crops.get("total_amount")
+        if amount_crop is not None:
+
+            st.write("🟩 UNet 金額 ROI：")
+            st.image(amount_crop, width=380)
+
+            # ------- GPT 讀取 ROI 金額 -------
+            gpt_roi_amount = gpt_read_amount_from_roi(apikey, amount_crop)
+
+            st.write("🟩 GPT ROI 金額（raw）:", gpt_roi_amount)
+
+            if gpt_roi_amount.isdigit():
+                meta["total_amount"] = gpt_roi_amount
+                # 不 return，仍讓後面 gpt_fix_ocr() 有機會修補其它欄位
+            else:
+                st.warning("GPT ROI 未成功 → 將使用 OCR/後處理 fallback。")
     return meta
-
-# ============================================================
-# Part 3 — QR 全圖偵測（pyzxing + OpenCV fallback）+ TEXT QR 品項解析
-# ============================================================
 
 # ------------------------------
 # QR：pyzxing (主力)
@@ -413,19 +924,49 @@ def parse_text_qr_items(text: str):
 # 品項 → 金額等比例調整（符合總金額）
 # ------------------------------
 def adjust_items_with_total(items, total_amount):
-    if not items or total_amount <= 0:
-        return items
-        
-    subtotal = sum(it["qty"] * it["price"] for it in items)
-    if subtotal <= 0:
+    """
+    將 TEXT QR 品項以比例調整，並四捨五入到整數，
+    最後用差額補到最大金額的品項，確保總金額完全對齊。
+    """
+
+    if not items or total_amount is None:
         return items
 
-    ratio = total_amount / subtotal
+    try:
+        total_amount = int(float(total_amount))
+    except:
+        return items
+
+    # 1. 計算原始小計
+    original_subtotal = sum(it["qty"] * it["price"] for it in items)
+    if original_subtotal <= 0:
+        return items
+
+    ratio = total_amount / original_subtotal
+
+    # 2. 按比例 + 四捨五入
+    adjusted = []
     for it in items:
-        new_price = round(it["price"] * ratio, 2)
-        it["price"] = new_price
-        it["amount"] = round(it["qty"] * new_price, 2)
-    return items
+        new_price = it["price"] * ratio
+        new_amount = round(new_price * it["qty"])  # ← 四捨五入整數
+        adjusted.append({
+            "name": it["name"],
+            "qty": it["qty"],
+            "price": round(new_price),  # 單價四捨五入
+            "amount": new_amount,
+        })
+
+    # 3. 檢查與總金額誤差
+    sum_after = sum(it["amount"] for it in adjusted)
+    diff = total_amount - sum_after
+
+    # 4. 用最大 amount 的品項補差額（避免不自然）
+    if diff != 0:
+        idx = max(range(len(adjusted)), key=lambda i: adjusted[i]["amount"])
+        adjusted[idx]["amount"] += diff
+
+    return adjusted
+
 
 # ------------------------------
 # 主流程：全圖偵測 → 合併 TEXT QR → 解析 → 回傳
@@ -433,66 +974,136 @@ def adjust_items_with_total(items, total_amount):
 import re
 
 def is_real_text_qr(text: str) -> bool:
-    """超寬鬆版 TEXT QR 判斷，永遠不會漏掉任何一顆（包含載具贈品那顆）"""
-    if not text or not isinstance(text, str):
+    if not text:
         return False
+
     text = text.strip()
-    
-    # 只要包含這些關鍵字，就一定是 TEXT QR（不管多亂）
-    keywords = ["**:", "※※", "隨貨發票", "載具", "*********", "加鹽黑松", "點數", "贈送"]
-    if any(kw in text for kw in keywords):
+
+    # ------ 排除新版主 QR ------
+    if text.startswith(("QF", "QG", "QA", "QS")):
+        return False
+
+    # ------ 排除舊版主 QR ------
+    if text.startswith("**") and re.match(r"\*\*[A-Z]{2}\d{8}", text):
+        return False
+
+    # ------ 規律 1：中文 + 數量 + 價格
+    if re.search(r"[\u4E00-\u9FFF]+.*:\d+:\d+", text):
         return True
-        
-    # 或者符合標準格式：有品名:數量:單價結構
-    if re.search(r'[^\d\s]{2,}.*?\d+:\d+$', text):
+
+    # ------ 規律 2：至少兩個冒號（品項格式）------
+    if text.count(":") >= 2:
         return True
-        
-    # 或者長度超過 50（載具碼那顆一定很長）
-    if len(text) > 50:
-        return True
-        
+
     return False
 
+def debug_qr_classification(text: str):
+    """
+    回傳 (is_text_qr, rule) 用於 Debug 顯示。
+    """
+    if not text:
+        return False, "EMPTY"
 
-def detect_invoice_items(pil_img, total_amount):
+    t = text.strip()
 
-    # Step1: 掃描 QR
-    pzx = decode_qr_pyzxing(pil_img)
-    ocv = decode_qr_opencv(pil_img)
+    # 新版主 QR
+    if t.startswith(("QF", "QG", "QA", "QS")):
+        return False, "主QR:新版v3"
 
-    raw_all = pzx + ocv
+    # 舊版主 QR
+    if t.startswith("**") and re.match(r"\*\*[A-Z]{2}\d{8}", t):
+        return False, "主QR:舊版"
 
-    # Step2: 過濾出真正 TEXT QR
-    text_qrs = [t for t in raw_all if is_real_text_qr(t)]
+    # 品項規則（最強）中文 + 數量 + 金額
+    if re.search(r"[\u4E00-\u9FFF].*:\d+:\d+", t):
+        return True, "TEXT:中文+數量+金額"
 
-    text_qrs = list(set(text_qrs))  # 去除重複
+    # 至少兩個冒號
+    if t.count(":") >= 2:
+        return True, "TEXT:冒號>=2"
 
-    # DEBUG
-    # st.write("FILTERED TEXT QRs:", text_qrs)
+    return False, "NOT_TEXT"
 
-    final_items = []
 
-    # Step3: 逐段解析
-    for t in text_qrs:
-        items = parse_text_qr_items(t)
-        final_items.extend(items)
+def detect_invoice_items_from_qr(qr_left, qr_right, total_amount):
+    """
+    直接使用 parse_qr_invoice() 的輸出
+    不重新掃整張圖（pyzxing / opencv）
+    TEXT QR Debugger 永遠不會空
+    """
 
-    if not final_items:
+    st.markdown("### 🐞 TEXT QR Debugger（from parse_qr_invoice）")
+
+    # Step 1：把前面抓到的 QR 收進來
+    raw_all = []
+    if qr_left:
+        raw_all.append(qr_left)
+    if qr_right:
+        raw_all.append(qr_right)
+
+    st.write("📌 raw_all (parse_qr_invoice 結果)")
+    st.write(raw_all)
+
+    # Step 2：分類
+    main_qr = []
+    text_qr = []
+    debug_details = []
+
+    for raw in raw_all:
+        is_text, rule = debug_qr_classification(raw)
+        debug_details.append((raw, rule))
+
+        if rule.startswith("主QR"):
+            main_qr.append(raw)
+        elif is_text:
+            text_qr.append(raw)
+
+    st.write("📌 主 QR 分類結果：", main_qr)
+    st.write("📌 TEXT QR 分類結果：", text_qr)
+    st.write("📌 Rule 判斷：")
+    for raw, rule in debug_details:
+        st.write(f"- `{raw}` → `{rule}`")
+
+    # Step 3：沒有 TEXT QR → 結束
+    if not text_qr:
+        st.warning("⚠ 未偵測到 TEXT QR")
         return {
-            "pyzxing_raw": pzx,
-            "opencv_raw": ocv,
-            "merged_text_qr": text_qrs
+            "raw_all": raw_all,
+            "main_qr": main_qr,
+            "text_qr": [],
+            "debug": debug_details
         }, []
 
-    # Step4: 金額調整
-    final_items = adjust_items_with_total(final_items, total_amount)
+    # Step 4：合併 TEXT QR
+    combined_text = ":".join(text_qr)
+    st.write("📌 合併後 TEXT QR：")
+    st.code(combined_text)
+
+    # Step 5：解析 items
+    items = parse_text_qr_items(combined_text)
+    st.write("📌 解析後 items：")
+    st.write(items)
+
+    if not items:
+        st.error("❌ parse_text_qr_items 回傳空（格式怪異）")
+        return {
+            "raw_all": raw_all,
+            "main_qr": main_qr,
+            "text_qr": text_qr,
+            "combined_text": combined_text,
+            "debug": debug_details
+        }, []
+
+    # Step 6：金額等比例調整
+    items = adjust_items_with_total(items, total_amount)
 
     return {
-        "pyzxing_raw": pzx,
-        "opencv_raw": ocv,
-        "merged_text_qr": text_qrs
-    }, final_items
-
+        "raw_all": raw_all,
+        "main_qr": main_qr,
+        "text_qr": text_qr,
+        "combined_text": combined_text,
+        "debug": debug_details
+    }, items
 
 # ============================================================
 # Part 4 — UI + Supabase 儲存 + Tab1 / Tab2 主體
@@ -546,164 +1157,380 @@ def save_invoice_items(invoice_id, items):
 # ============================================================
 tab1, tab2 = st.tabs(["📤 發票上傳", "📊 發票分析儀表板"])
 
-# ============================================================
-# TAB 1 — 深色版 發票上傳頁
-# ============================================================
 with tab1:
-    
+
     st.markdown("<h2>📤 上傳並辨識發票</h2>", unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("請選擇發票圖片 (JPG / PNG)", type=["jpg","jpeg","png"])
+    uploaded = st.file_uploader("請選擇發票圖片 (JPG / PNG)", type=["jpg", "jpeg", "png"])
 
-    checkpoint_path = "checkpoints/best_unet_model.pth"
+    checkpoint_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_unet_model.pth")
 
+    # ==============================
+    # 🔹 Case A：沒有重新上傳 → 使用上一次的結果
+    # ==============================
+    if not uploaded and "last_meta" in st.session_state:
+
+        pil_img = st.session_state["last_image"]
+        meta = st.session_state["last_meta"]
+        items = st.session_state["last_items"]
+
+        st.image(pil_img, caption="📸 原始影像 (快取)", width='stretch')
+
+        st.markdown("### 🧾 發票資訊（已快取，不重新辨識）")
+        st.write(f"**發票號碼：** {meta['invoice_no']}")
+        st.write(f"**日期：** {meta['date']}")
+        st.write(f"**總金額：** NT$ {meta['total_amount']}")
+
+    # ==============================
+    # 🔹 Case B：使用者有上傳 → 重新辨識
+    # ==============================
     if uploaded:
-        col_img, col_info = st.columns([1,1])
-
         pil_img = Image.open(uploaded).convert("RGB")
+
+        col_img, col_info = st.columns([1, 1])
 
         with col_img:
             st.image(pil_img, caption="📸 原始影像", width='stretch')
 
         with col_info:
-            with st.spinner("🔍 UNet Segmentation + OCR 辨識中…"):
-                meta = extract_invoice_meta(
-                    pil_img=pil_img,
-                    checkpoint_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_unet_model.pth"),
-                    apikey=apikey
-                )
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            meta, qr_left, qr_right = extract_invoice_meta(
+                uploaded_file=uploaded,   
+                pil_img=pil_img,
+                checkpoint_path=checkpoint_path,
+                apikey=apikey
+            )
+
+            meta = meta or {}
+            # ===== 儲存結果（避免 Rerun 重跑辨識）=====
+            st.session_state["last_image"] = pil_img
+            st.session_state["last_meta"] = meta
+
             st.markdown("### 🧾 發票資訊")
-            st.write(f"**發票號碼：** <span class='highlight'>{meta.get('invoice_no','')}</span>", unsafe_allow_html=True)
-            st.write(f"**日期：** <span class='highlight'>{meta.get('date','')}</span>", unsafe_allow_html=True)
-            st.write(f"**總金額：** <span class='highlight'>NT$ {meta.get('total_amount','')}</span>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+            st.write(f"**發票號碼：** {meta.get('invoice_no', '未知')}")
+            st.write(f"**日期：** {meta.get('date', '未知')}")
+            st.write(f"**總金額：** NT$ {meta.get('total_amount', '未知')}")
 
-        # 整理金額
-        try:
-            total_amount = float(re.sub(r"[^0-9.]", "", meta.get("total_amount", "0")))
-        except:
-            total_amount = 0
+        # ==============================
+        # 🔍 QR Code 掃描
+        # ==============================
+        with st.spinner("📡 TEXT QR 掃描中…"):
+    
+            debug_info, items = detect_invoice_items_from_qr(
+                qr_left,
+                qr_right,
+                meta.get("total_amount", "0")
+            )
+            
+        st.session_state["last_items"] = items
 
-        # 🔍 QR 全圖掃描
-        with st.spinner("📡 QR Code 掃描中…"):
-            debug_qr, items = detect_invoice_items(pil_img, total_amount)
+    # ==============================
+    # 📦 TEXT QR 品項顯示
+    # ==============================
+    st.markdown("### 📦 TEXT QR 品項")
 
-        st.markdown("### 📦 TEXT QR 品項")
+    if "last_items" in st.session_state:
+        items = st.session_state["last_items"]
+
         if items:
             df_items = pd.DataFrame(items)
+
+            df_items["price"] = df_items["price"].astype(float).round(0)
+            df_items["qty"] = df_items["qty"].astype(float)
+
+            # 🔥 合併同品項
+            df_items = (
+                df_items.groupby("name", as_index=False)
+                .agg({"qty": "sum", "price": "first"})
+            )
+
+            df_items["amount"] = (df_items["qty"] * df_items["price"]).round(0)
+
             st.dataframe(df_items, width='stretch')
         else:
             st.info("📭 未偵測到 TEXT QR 品項")
 
-        # 類別 + 備註
-        st.markdown("### 🏷 類別與備註")
-        category = st.selectbox("類別 Category", ["餐飲","購物","交通","娛樂","日用品","其他"])
-        note = st.text_input("備註 Note")
+    # ==============================
+    # 🏷 類別 + 備註
+    # ==============================
+    st.markdown("### 🏷 類別與備註")
+    category = st.selectbox("類別 Category", ["餐飲","購物","交通","娛樂","日用品","其他"])
+    note = st.text_input("備註 Note")
 
-        # 儲存
-        if supabase:
-            if st.button("💾 儲存到資料庫", type="primary"):
-                invoice_id = save_invoice_main(meta, total_amount, category, note)
-                if invoice_id:
-                    ok = save_invoice_items(invoice_id, items)
-                    if ok:
-                        st.success("🎉 發票與品項成功儲存！")
-                    else:
-                        st.error("❌ 品項儲存失敗")
+    # ============================================================
+    # 🟩 背景儲存功能（不阻塞、不卡畫面）
+    # ============================================================
+    import threading
+
+    def async_save_invoice(meta, total_amount, category, note, items):
+        def job():
+            try:
+                st.session_state.save_status = "saving"
+                st.session_state.last_save_time = None
+
+                # 儲存主表
+                res = supabase.table("invoices_data").insert({
+                    "invoice_no": meta.get("invoice_no", "未知"),
+                    "date": meta.get("date"),
+                    "total_amount": float(total_amount),
+                    "category": category,
+                    "note": note or None,
+                }).execute()
+
+                if not res.data:
+                    raise Exception("主表儲存失敗")
+
+                invoice_id = res.data[0]["id"]
+
+                # 批次儲存品項（超快）
+                if items:
+                    batch = []
+                    for it in items:
+                        batch.append({
+                            "invoice_id": invoice_id,
+                            "name": str(it["name"]),
+                            "qty": float(it["qty"]),
+                            "price": float(it["price"]),
+                            "amount": float(it["amount"]),
+                        })
+                    supabase.table("invoice_items").insert(batch).execute()
+
+                # 成功！
+                st.session_state.save_status = "success"
+                st.session_state.last_save_time = pd.Timestamp.now().strftime("%H:%M:%S")
+
+            except Exception as e:
+                st.session_state.save_status = "error"
+                st.session_state.last_error = str(e)
+
+        threading.Thread(target=job, daemon=True).start()
+
+    # ============================================================
+    # 💾 儲存按鈕（不卡畫面，不重跑辨識）
+    # ============================================================
+    if supabase:
+        col_save1, col_save2 = st.columns([1, 5])
+        with col_save1:
+            # 關鍵防呆：正在儲存時按鈕變灰 + 不能再按
+            save_button_disabled = (st.session_state.save_status == "saving")
+            
+            if st.button(
+                "儲存" if not save_button_disabled else "儲存中…",
+                type="primary",
+                use_container_width=True,
+                disabled=save_button_disabled,   # 這行是王道！
+                key="save_btn"
+            ):
+                try:
+                    total_amount = float(re.sub(r"[^\d.]", "", str(meta.get("total_amount", "0"))))
+                except:
+                    total_amount = 0.0
+                    
+                async_save_invoice(meta, total_amount, category, note, items)
+                # 按下去就立刻改狀態（避免狂按）
+                st.session_state.save_status = "saving"
+
+        # === 即時狀態通知（保持不變）===
+        status = st.session_state.save_status
+        
+        if status == "saving":
+            st.info("正在背景儲存中… 你可以馬上辨識下一張！")
+            
+        elif status == "success":
+            st.success(f"儲存成功！（{st.session_state.last_save_time}）")
+            st.balloons()
+            time.sleep(2.5)
+            st.session_state.save_status = "idle"
+            st.rerun()
+            
+        elif status == "error":
+            st.error(f"儲存失敗：{st.session_state.last_error}")
+            if st.button("重試儲存"):
+                st.session_state.save_status = "idle"
+                st.rerun()
+                
         else:
-            st.warning("❗ Supabase 未連線，無法儲存資料")
+            st.info("可以開始儲存下一張發票了喔～")   # 改得更清楚！
+# ============================================================
+# TAB 2 — 儀表板（使用 cache，完全不會拖慢 TAB1）
+# ============================================================
+
+# --------- 🚀 加速：Supabase 讀取快取 --------------
+@st.cache_data(ttl=300, show_spinner=False)  # 5分鐘內絕對不重抓
+def load_all_data():
+    try:
+        # 一次把主表 + 所有品項一起抓下來（Supabase 支援 nested select）
+        response = supabase.table("invoices_data")\
+            .select("*, invoice_items(*)", count="exact")\
+            .order("date", desc=True)\
+            .execute()
+        
+        data = response.data
+        # 把嵌套的 invoice_items 展開成平的（方便後面使用）
+        flat_rows = []
+        for inv in data:
+            items = inv.pop("invoice_items", [])
+            if not items:
+                flat_rows.append(inv)
+            else:
+                for item in items:
+                    row = inv.copy()
+                    row.update(item)
+                    flat_rows.append(row)
+        return pd.DataFrame(flat_rows)
+    except Exception as e:
+        st.error(f"載入資料失敗：{e}")
+        return pd.DataFrame()
 
 
-# ============================================================
-# TAB 2 — 深色專業版 財務儀表板
-# ============================================================
+# --------- 🚀 加速：圖表快取 ---------------------
+@st.cache_resource
+def plot_monthly(df_inv):
+    monthly = df_inv.groupby("year_month")["total_amount"].sum().reset_index()
+    monthly["year_month"] = monthly["year_month"].astype(str)
+    return monthly
+
+
 with tab2:
-    st.markdown("<h2>📊 發票記帳儀表板</h2>", unsafe_allow_html=True)
+    st.markdown("<h2>發票記帳儀表板</h2>", unsafe_allow_html=True)
 
     if not supabase:
-        st.warning("尚未連接 Supabase")
-    else:
-        with st.spinner("讀取資料中…"):
-            invoices = supabase.table("invoices_data").select("*").order("date", desc=True).execute().data
-            items = supabase.table("invoice_items").select("*").execute().data
+        st.warning("Supabase 未連線")
+        st.stop()
 
-        if not invoices:
-            st.info("📭 目前沒有資料")
+    # ========= 超快載入：一次抓全部資料 + 5分鐘快取 =========
+    @st.cache_data(ttl=300, show_spinner=False)  # 5分鐘快取
+    def load_all_data():
+        try:
+            # Step 1: 抓主表
+            inv_resp = supabase.table("invoices_data")\
+                .select("*")\
+                .order("date", desc=True)\
+                .execute()
+            
+            if not inv_resp.data:
+                return pd.DataFrame()
+
+            df_inv = pd.DataFrame(inv_resp.data)
+
+            # Step 2: 抓品項表
+            items_resp = supabase.table("invoice_items")\
+                .select("*")\
+                .execute()
+
+            if not items_resp.data:
+                # 沒有品項也沒關係，至少主表有資料
+                df_inv["name"] = None
+                df_inv["qty"] = None
+                df_inv["price"] = None
+                df_inv["amount"] = None
+                return df_inv
+
+            df_items = pd.DataFrame(items_resp.data)
+
+            # Step 3: 合併（左外連結）
+            df_merged = df_inv.merge(df_items, left_on="id", right_on="invoice_id", how="left", suffixes=("", "_item"))
+
+            return df_merged
+
+        except Exception as e:
+            st.error(f"載入資料失敗：{e}")
+            return pd.DataFrame()
+        
+
+    df_all = load_all_data()
+
+    if df_all.empty:
+        st.info("還沒有任何發票資料，快去上傳第一張吧！")
+        st.stop()
+
+    # 預處理日期
+    df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce")
+    df_all["year_month"] = df_all["date"].dt.to_period("M").astype(str)
+
+    # ========= KPI =========
+    col1, col2, col3 = st.columns(3)
+    current_month_str = df_all["year_month"].max()
+    df_current = df_all[df_all["year_month"] == current_month_str]
+
+    with col1:
+        st.metric("本月消費", f"NT$ {df_current['total_amount'].sum():,.0f}")
+
+    with col2:
+        months = sorted(df_all["year_month"].unique(), reverse=True)
+        last_month_str = months[1] if len(months) > 1 else current_month_str
+        last_amount = df_all[df_all["year_month"] == last_month_str]["total_amount"].sum()
+        growth = ((df_current["total_amount"].sum() - last_amount) / last_amount * 100) if last_amount > 0 else 0
+        st.metric("月成長率", f"{growth:+.1f}%")
+
+    with col3:
+        top_cat = df_current.groupby("category")["total_amount"].sum()
+        st.metric("最大類別", top_cat.idxmax() if not top_cat.empty else "無")
+
+    # ========= 每月支出趨勢 =========
+    monthly = df_all.groupby("year_month")["total_amount"].sum().reset_index()
+    monthly["year_month"] = monthly["year_month"].astype(str)
+    st.line_chart(monthly.set_index("year_month"))
+
+    # ========= 類別圓餅圖 =========
+    cat_sum = df_all.groupby("category")["total_amount"].sum()
+    if not cat_sum.empty:
+        fig = px.pie(values=cat_sum.values, names=cat_sum.index, hole=0.5)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ========= 選擇月份 =========
+    months = sorted(df_all["year_month"].unique(), reverse=True)
+    selected_month = st.selectbox("查看特定月份", months, index=0)
+    df_month = df_all[df_all["year_month"] == selected_month]
+
+    # 顯示該月發票列表
+    display_cols = ["date", "invoice_no", "total_amount", "category", "note"]
+    st.dataframe(
+        df_month[display_cols].sort_values("date", ascending=False),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========= 選擇發票查看品項 =========
+    invoice_ids = df_month["id"].dropna().unique().tolist()
+    if invoice_ids:
+        selected_id = st.selectbox(
+            "選擇發票查看品項",
+            options=invoice_ids,
+            format_func=lambda x: f"{df_month[df_month['id']==x]['date'].iloc[0].strftime('%Y-%m-%d')}｜{df_month[df_month['id']==x]['invoice_no'].iloc[0]}｜NT${df_month[df_month['id']==x]['total_amount'].iloc[0]:,.0f}"
+        )
+
+        items_df = df_month[df_month["id"] == selected_id]
+        if "name" in items_df.columns and not items_df["name"].isna().all():
+            st.dataframe(items_df[["name", "qty", "price", "amount"]], use_container_width=True)
         else:
-            df_inv = pd.DataFrame(invoices)
-            df_items = pd.DataFrame(items)
+            st.info("這張發票沒有品項資料（可能是用 QR 直接存的）")
 
-            df_inv["date"] = pd.to_datetime(df_inv["date"], errors="coerce")
-            df_inv["year_month"] = df_inv["date"].dt.to_period("M")
+    # ========= 刪除發票功能 =========
+    st.markdown("---")
+    st.markdown("### 刪除發票（含所有品項）")
 
-            # ========= 顯示 KPI 區塊 =========
-            st.markdown("### 💎 本月概要")
-            colA, colB, colC = st.columns(3)
+    if invoice_ids:
+        delete_id = st.selectbox(
+            "選擇要刪除的發票（小心！無法復原）",
+            options=invoice_ids,
+            format_func=lambda x: f"{df_month[df_month['id']==x]['date'].iloc[0].strftime('%Y-%m-%d')} | {df_month[df_month['id']==x]['invoice_no'].iloc[0]} | NT${df_month[df_month['id']==x]['total_amount'].iloc[0]:,.0f}",
+            key="delete_select"
+        )
 
-            this_month = df_inv["year_month"].astype(str).max()
-            df_this_month = df_inv[df_inv["year_month"].astype(str) == this_month]
-
-            with colA:
-                st.markdown("<div class='card'>", unsafe_allow_html=True)
-                st.markdown("📅 本月消費")
-                st.markdown(f"<h3 class='highlight'>NT$ {df_this_month['total_amount'].sum():,.0f}</h3>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            with colB:
-                last_month = sorted(df_inv["year_month"].astype(str).unique())[-2] if len(df_inv) > 1 else this_month
-                df_last_month = df_inv[df_inv["year_month"].astype(str) == last_month]
-
-                growth = 0
-                if df_last_month["total_amount"].sum() > 0:
-                    growth = ((df_this_month["total_amount"].sum() - df_last_month["total_amount"].sum())
-                            / df_last_month["total_amount"].sum()) * 100
-
-                st.markdown("<div class='card'>", unsafe_allow_html=True)
-                st.markdown("📈 月成長率")
-                st.markdown(f"<h3 class='highlight'>{growth:.1f}%</h3>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            with colC:
-                top_cat = df_this_month.groupby("category")["total_amount"].sum().reset_index()
-                top_cat = top_cat.sort_values("total_amount", ascending=False)
-                top_name = top_cat.iloc[0]["category"] if len(top_cat) > 0 else "無資料"
-
-                st.markdown("<div class='card'>", unsafe_allow_html=True)
-                st.markdown("🏷 本月最大支出類別")
-                st.markdown(f"<h3 class='highlight'>{top_name}</h3>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            # ========= 每月折線圖 =========
-            st.markdown("### 📉 每月支出趨勢")
-            monthly = df_inv.groupby("year_month")["total_amount"].sum().reset_index()
-            monthly["year_month"] = monthly["year_month"].astype(str)
-
-            st.line_chart(monthly, x="year_month", y="total_amount")
-
-            # ========= 圓餅圖 =========
-            st.markdown("### 🥧 類別支出比例")
-            cat_sum = df_inv.groupby("category")["total_amount"].sum().reset_index()
-            fig = px.pie(cat_sum, names="category", values="total_amount", hole=0.45)
-            st.plotly_chart(fig, width='stretch')
-
-            # ========= 月份選擇 =========
-            st.markdown("### 🔍 查看特定月份")
-            month_selected = st.selectbox("選擇月份", monthly["year_month"].unique())
-
-            df_month = df_inv[df_inv["year_month"] == month_selected]
-            st.dataframe(df_month, width='stretch')
-
-            # ========= 發票選擇 =========
-            st.markdown("### 📄 選擇發票查看品項")
-            invoice_id_selected = st.selectbox("選擇發票 ID", df_month["id"])
-
-            df_selected_items = df_items[df_items["invoice_id"] == invoice_id_selected]
-            st.dataframe(df_selected_items, width='stretch')
-
-            # ========= 刪除發票 =========
-            st.markdown("### 🗑 刪除此發票")
-            if st.button("❗ 刪除（含所有品項）"):
-                supabase.table("invoice_items").delete().eq("invoice_id", invoice_id_selected).execute()
-                supabase.table("invoices_data").delete().eq("id", invoice_id_selected).execute()
-                st.success("已刪除成功！請重新整理頁面")
+        col_del1, col_del2 = st.columns([1, 4])
+        with col_del1:
+            if st.button("🗑 刪除這張發票（不可恢復）", type="secondary", use_container_width=True):
+                with st.spinner("刪除中…"):
+                    try:
+                        # 真的刪除
+                        supabase.table("invoices_data").delete().eq("id", delete_id).execute()
+                        
+                        # 強制清除快取 ← 這一行是王道！
+                        st.cache_data.clear()
+                        
+                        st.success("已成功刪除！畫面即將更新")
+                        st.balloons()
+                        time.sleep(1)
+                        st.rerun()  # 重新載入最新資料
+                    except Exception as e:
+                        st.error(f"刪除失敗：{e}")
