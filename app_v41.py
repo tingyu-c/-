@@ -171,23 +171,44 @@ def extract_from_qr_zxing(pil_img: Image.Image):
 
     return decoded_texts
 
-def clean_invoice_no(text: str) -> str:
+def clean_invoice_no(raw: str) -> str:
     """
-    清理 OCR 讀出來的發票號碼，例如：
-    - 移除空白與非字母數字
-    - 若格式正確（AA99999999）就輸出
+    清理各種發票號碼格式：
+    支援：
+    - TL-42103447
+    - TL42103447
+    - TL 42103447
+    - TL：42103447
+    - TL－42103447（全形 dash）
+    - OCR 抓到的英數混雜符號
+    - 混入其他亂碼的情況
+
+    最終輸出：AA99999999（2 英文字 + 8 數字）
     """
-    if not text:
+    if not raw or not isinstance(raw, str):
         return ""
 
-    text = text.upper().strip()
-    text = re.sub(r"[^A-Z0-9]", "", text)
+    # 統一格式
+    raw = raw.upper().strip()
+    
+    # 移除所有非字母數字（包含 dash、空白、全形符號）
+    raw = re.sub(r"[^A-Z0-9]", "", raw)
 
-    # 符合標準格式
-    if re.fullmatch(r"[A-Z]{2}\d{8}", text):
-        return text
+    # 直接找標準格式（最重點）
+    match = re.search(r"[A-Z]{2}\d{8}", raw)
+    if match:
+        return match.group(0)
 
-    return ""
+    # fallback：拆字母 + 數字重新組合
+    letters = re.findall(r"[A-Z]", raw)
+    digits = re.findall(r"\d", raw)
+
+    if len(letters) >= 2 and len(digits) >= 8:
+        return "".join(letters[:2]) + "".join(digits[:8])
+
+    # 能救多少算多少：至少保持乾淨，不報錯
+    return raw
+
 
 
 def clean_date(text: str) -> str:
@@ -388,7 +409,7 @@ def extract_invoice_meta(uploaded_file, pil_img, checkpoint_path, apikey):
     info_left = parse_left_qr(qr_left)
 
     if info_left.get("total_amount"):
-        meta["invoice_no"] = info_left.get("invoice_no", meta["invoice_no"])
+        meta["invoice_no"] = clean_invoice_no(info_left.get("invoice_no", meta["invoice_no"]))
         meta["date"] = info_left.get("date", meta["date"])
 
         # 左 QR 100% 最準 → 覆蓋 GPT ROI 金額
@@ -519,7 +540,7 @@ def gpt_fix_ocr(api_key, pil_img, raw_ocr):
 
         # --- 最終保險：確保三個欄位一定存在 ---
         return {
-            "invoice_no": fixed.get("invoice_no", "") or raw_ocr.get("invoice_no", ""),
+            "invoice_no": clean_invoice_no(fixed.get("invoice_no", "") or raw_ocr.get("invoice_no", "")),
             "date": fixed.get("date", "") or raw_ocr.get("date", ""),
             "total_amount": fixed.get("total_amount", "") or raw_ocr.get("total_amount", ""),
         }
@@ -999,14 +1020,23 @@ def is_real_text_qr(text: str) -> bool:
 
 def debug_qr_classification(text: str):
     """
-    回傳 (is_text_qr, rule) 用於 Debug 顯示。
+    新版：優先判斷 TEXT QR，即使是 QG / QF 開頭也要檢查是否含品項。
     """
     if not text:
         return False, "EMPTY"
 
     t = text.strip()
 
-    # 新版主 QR
+    # 🔥 1. 優先判斷是否為 TEXT QR
+    # 有中文品名 + 冒號 + 數量 + 價格
+    if re.search(r"[\u4E00-\u9FFF].*:\d+:\d+", t):
+        return True, "TEXT:中文+數量+價格"
+
+    # 或者至少兩個冒號，也視為 TEXT 格式
+    if t.count(":") >= 2 and re.search(r"[\u4E00-\u9FFF]", t):
+        return True, "TEXT:多冒號+中文"
+
+    # 🔥 2. 才判斷是否為新版主 QR（QG/QF/etc）
     if t.startswith(("QF", "QG", "QA", "QS")):
         return False, "主QR:新版v3"
 
@@ -1014,15 +1044,8 @@ def debug_qr_classification(text: str):
     if t.startswith("**") and re.match(r"\*\*[A-Z]{2}\d{8}", t):
         return False, "主QR:舊版"
 
-    # 品項規則（最強）中文 + 數量 + 金額
-    if re.search(r"[\u4E00-\u9FFF].*:\d+:\d+", t):
-        return True, "TEXT:中文+數量+金額"
-
-    # 至少兩個冒號
-    if t.count(":") >= 2:
-        return True, "TEXT:冒號>=2"
-
     return False, "NOT_TEXT"
+
 
 
 def detect_invoice_items_from_qr(qr_left, qr_right, total_amount):
