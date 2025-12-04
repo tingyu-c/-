@@ -1,4 +1,4 @@
-# 📘 發票記帳神器 v42
+# 📘 發票記帳神器 v41
 
 **UNet Segmentation + OCR + GPT-4o-mini Fallback + QR 掃描 + Supabase 儲存**
 
